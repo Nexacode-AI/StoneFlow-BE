@@ -1,0 +1,200 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─── Enums ────────────────────────────────────────────────────────────────────
+
+enum Role {
+  ADMIN
+  MANAGER
+  CUTTER
+  POLISHER
+  EDGE_FINISHER
+  PACKER
+  LOADER
+  INSTALLER
+  QC_INSPECTOR
+  DRIVER
+  WORKER
+}
+
+enum Language {
+  ENGLISH
+  BANGLA
+  MANDARIN
+  BAHASA_MALAY
+  TAMIL
+}
+
+enum JobStatus {
+  PENDING
+  IN_PROGRESS
+  PAUSED
+  COMPLETED
+  CANCELLED
+}
+
+enum Priority {
+  LOW
+  NORMAL
+  HIGH
+  URGENT
+}
+
+enum StepStatus {
+  WAITING
+  NOTIFIED
+  IN_PROGRESS
+  ISSUE
+  HELP_NEEDED
+  COMPLETED
+  SKIPPED
+}
+
+enum MessageDirection {
+  OUTBOUND
+  INBOUND
+}
+
+// ─── Models ───────────────────────────────────────────────────────────────────
+
+model User {
+  id        String   @id @default(uuid())
+  name      String
+  phone     String   @unique
+  email     String?  @unique
+  role      Role     @default(WORKER)
+  language  Language @default(ENGLISH)
+  isActive  Boolean  @default(true)
+  avatarUrl String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  assignedSteps WorkflowStep[]
+  messages      WhatsAppMessage[]
+  photos        JobPhoto[]
+  auditLogs     AuditLog[]
+}
+
+model Job {
+  id           String    @id @default(uuid())
+  jobNumber    String    @unique
+  title        String
+  clientName   String
+  clientPhone  String?
+  description  String?
+  measurements String?
+  material     String?
+  color        String?
+  deadline     DateTime
+  status       JobStatus @default(PENDING)
+  priority     Priority  @default(NORMAL)
+  totalSteps   Int       @default(0)
+  completedSteps Int     @default(0)
+  notes        String?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+  completedAt  DateTime?
+
+  workflowSteps WorkflowStep[]
+  photos        JobPhoto[]
+  messages      WhatsAppMessage[]
+  auditLogs     AuditLog[]
+}
+
+model WorkflowStep {
+  id             String     @id @default(uuid())
+  jobId          String
+  stepNumber     Int
+  name           String
+  description    String?
+  assignedUserId String?
+  status         StepStatus @default(WAITING)
+  startedAt      DateTime?
+  completedAt    DateTime?
+  dueAt          DateTime?
+  notes          String?
+  issueText      String?
+  createdAt      DateTime   @default(now())
+  updatedAt      DateTime   @updatedAt
+
+  job          Job           @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  assignedUser User?         @relation(fields: [assignedUserId], references: [id])
+  messages     WhatsAppMessage[]
+  photos       JobPhoto[]
+  auditLogs    AuditLog[]
+
+  @@unique([jobId, stepNumber])
+}
+
+model WhatsAppMessage {
+  id          String           @id @default(uuid())
+  jobId       String?
+  stepId      String?
+  userId      String?
+  direction   MessageDirection
+  waMessageId String?          @unique
+  content     String
+  messageType String           @default("text")
+  status      String           @default("sent")
+  sentAt      DateTime         @default(now())
+
+  job  Job?          @relation(fields: [jobId], references: [id])
+  step WorkflowStep? @relation(fields: [stepId], references: [id])
+  user User?         @relation(fields: [userId], references: [id])
+}
+
+model JobPhoto {
+  id           String   @id @default(uuid())
+  jobId        String
+  stepId       String?
+  uploadedById String?
+  url          String
+  thumbnailUrl String?
+  caption      String?
+  photoType    String   @default("progress")
+  uploadedAt   DateTime @default(now())
+
+  job        Job           @relation(fields: [jobId], references: [id])
+  step       WorkflowStep? @relation(fields: [stepId], references: [id])
+  uploadedBy User?         @relation(fields: [uploadedById], references: [id])
+}
+
+model AuditLog {
+  id          String   @id @default(uuid())
+  jobId       String?
+  stepId      String?
+  userId      String?
+  eventType   String
+  description String
+  metadata    Json?
+  createdAt   DateTime @default(now())
+
+  job  Job?          @relation(fields: [jobId], references: [id])
+  step WorkflowStep? @relation(fields: [stepId], references: [id])
+  user User?         @relation(fields: [userId], references: [id])
+}
+
+model WorkflowTemplate {
+  id          String   @id @default(uuid())
+  name        String
+  description String?
+  steps       Json
+  isDefault   Boolean  @default(false)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model SystemSettings {
+  id          String   @id @default("singleton")
+  companyName String   @default("Stone Co Sdn Bhd")
+  timezone    String   @default("Asia/Kuala_Lumpur")
+  notifyAdmin Boolean  @default(true)
+  autoStart   Boolean  @default(false)
+  updatedAt   DateTime @updatedAt
+}
