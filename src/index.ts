@@ -21,13 +21,26 @@ const app = express();
 const PORT = process.env.PORT || 4000;
 
 // ─── Security & parsing ───────────────────────────────────────────────────────
+const allowedOrigins = [
+  process.env.FRONTEND_URL || 'http://localhost:3000',
+  'http://localhost:3000',
+].filter(Boolean);
+
+const corsOptions: cors.CorsOptions = {
+  origin: (origin, callback) => {
+    // Allow requests with no origin (curl, mobile apps, health checks)
+    if (!origin || allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error(`CORS: origin ${origin} not allowed`));
+    }
+  },
+  credentials: true,
+};
+
 app.use(helmet());
-app.use(
-  cors({
-    origin: process.env.FRONTEND_URL || 'http://localhost:3000',
-    credentials: true,
-  }),
-);
+app.options('*', cors(corsOptions)); // handle preflight for all routes
+app.use(cors(corsOptions));
 app.use(morgan('dev'));
 
 // WhatsApp webhook from Twilio sends application/x-www-form-urlencoded
