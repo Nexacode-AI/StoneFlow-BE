@@ -55,6 +55,8 @@ router.get('/', async (_req: Request, res: Response) => {
   });
 
   // Alert steps: ISSUE or HELP_NEEDED
+  // Gated on notifyAdmin — when the admin-alerts toggle is OFF in Settings,
+  // no alerts appear in the dashboard UI and no WhatsApp is sent to admin.
   const alertSteps = settings.notifyAdmin
     ? await prisma.workflowStep.findMany({
         where: { status: { in: ['ISSUE', 'HELP_NEEDED'] } },
@@ -63,7 +65,7 @@ router.get('/', async (_req: Request, res: Response) => {
           assignedUser: { select: { id: true, name: true, phone: true } },
         },
         orderBy: { updatedAt: 'desc' },
-        take: 10,
+        take: 50,
       })
     : [];
 

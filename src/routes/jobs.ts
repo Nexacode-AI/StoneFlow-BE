@@ -184,6 +184,27 @@ router.delete('/:id', async (req: Request, res: Response) => {
   res.json({ success: true, message: 'Job deleted' });
 });
 
+// PATCH /api/jobs/:id/status — update job status only
+const StatusSchema = z.object({
+  status: z.enum(['PENDING', 'IN_PROGRESS', 'PAUSED', 'COMPLETED', 'CANCELLED']),
+});
+
+router.patch('/:id/status', async (req: Request, res: Response) => {
+  const parsed = StatusSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ success: false, errors: parsed.error.errors });
+    return;
+  }
+  const job = await prisma.job.update({
+    where: { id: String(req.params.id) },
+    data: {
+      status: parsed.data.status,
+      ...(parsed.data.status === 'COMPLETED' && { completedAt: new Date() }),
+    },
+  });
+  res.json({ success: true, data: job });
+});
+
 // POST /api/jobs/:id/start
 router.post('/:id/start', async (req: Request, res: Response) => {
   try {
@@ -232,6 +253,55 @@ router.post('/:id/steps', async (req: Request, res: Response) => {
     data: { totalSteps: { increment: 1 } },
   });
   res.status(201).json({ success: true, data: step });
+});
+
+// POST /api/jobs/:id/steps/:stepId/timer/start  – start countdown for a step
+router.post('/:id/steps/:stepId/timer/start', async (req: Request, res: Response) => {
+  const stepId = String(req.params.stepId);
+  const schema = z.object({ durationMinutes: z.number().int().positive() });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ success: false, errors: parsed.error.errors });
+    return;
+  }
+  const step = await prisma.workflowStep.update({
+    where: { id: stepId },
+    data: {
+      durationMinutes: parsed.data.durationMinutes,
+      timerStartedAt: new Date(),
+      timerAlertSentAt: null,  // reset so a new alert can fire when this timer expires
+    },
+    include: { assignedUser: true, job: { select: { jobNumber: true, title: true } } },
+  });
+  res.json({ success: true, data: step });
+});
+
+// POST /api/jobs/:id/steps/:stepId/timer/reset  – clear timer
+router.post('/:id/steps/:stepId/timer/reset', async (req: Request, res: Response) => {
+  const stepId = String(req.params.stepId);
+  const step = await prisma.workflowStep.update({
+    where: { id: stepId },
+    data: { durationMinutes: null, timerStartedAt: null, timerAlertSentAt: null },
+    include: { assignedUser: true },
+  });
+  res.json({ success: true, data: step });
+});
+
+// GET /api/jobs/timers/active  – list all steps with active timers
+router.get('/timers/active', async (_req: Request, res: Response) => {
+  const steps = await prisma.workflowStep.findMany({
+    where: {
+      timerStartedAt: { not: null },
+      durationMinutes: { not: null },
+      status: { in: ['IN_PROGRESS', 'NOTIFIED', 'WAITING'] },
+    },
+    include: {
+      assignedUser: { select: { id: true, name: true, phone: true, role: true } },
+      job: { select: { id: true, jobNumber: true, title: true, clientName: true } },
+    },
+    orderBy: { timerStartedAt: 'asc' },
+  });
+  res.json({ success: true, data: steps });
 });
 
 export default router;

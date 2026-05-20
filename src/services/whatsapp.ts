@@ -28,6 +28,7 @@ async function getSystemSettings() {
 }
 
 type MsgFn = (job: string, step: string, desc: string) => string;
+type TimerMsgFn = (job: string, step: string, minutes: number) => string;
 
 const STEP_MESSAGES: Record<string, Record<string, MsgFn>> = {
   ENGLISH: {
@@ -50,6 +51,20 @@ const STEP_MESSAGES: Record<string, Record<string, MsgFn>> = {
     assigned: (job: string, step: string, desc: string) =>
       `🏗️ *ஸ்டோன் கம்பெனி – வேலை #${job}*\n\nதங்களுக்கு ஒதுக்கப்பட்டது:\n*${step}*\n${desc}\n\nபதில் அனுப்புங்கள்:\n✅ *DONE* – வேலை முடிந்தது\n⚠️ *ISSUE* – பிரச்சனை தெரிவிக்கவும்\n🆘 *HELP* – உதவி தேவை`,
   },
+};
+
+// Timer expiry messages per language — sent to WORKER when time is up
+const TIMER_WORKER_MESSAGES: Record<string, TimerMsgFn> = {
+  ENGLISH: (job, step, minutes) =>
+    `⏰ *Time Alert – Job #${job}*\n\n*${step}* was given ${minutes} minutes.\n\nTime is up! Please update your status now:\n✅ *DONE* – Task completed\n⚠️ *ISSUE* – Report a problem\n🆘 *HELP* – Need assistance`,
+  BANGLA: (job, step, minutes) =>
+    `⏰ *সময় সতর্কতা – কাজ #${job}*\n\n*${step}* এর জন্য ${minutes} মিনিট সময় দেওয়া হয়েছিল।\n\nসময় শেষ! এখনই আপনার অবস্থা জানান:\n✅ *DONE* – কাজ শেষ\n⚠️ *ISSUE* – সমস্যা জানান\n🆘 *HELP* – সাহায্য দরকার`,
+  MANDARIN: (job, step, minutes) =>
+    `⏰ *时间提醒 – 工作 #${job}*\n\n*${step}* 分配了 ${minutes} 分钟。\n\n时间到了！请立即更新状态：\n✅ *DONE* – 任务完成\n⚠️ *ISSUE* – 报告问题\n🆘 *HELP* – 需要帮助`,
+  BAHASA_MALAY: (job, step, minutes) =>
+    `⏰ *Amaran Masa – Kerja #${job}*\n\n*${step}* diberi ${minutes} minit.\n\nMasa tamat! Sila kemas kini status anda sekarang:\n✅ *DONE* – Tugasan selesai\n⚠️ *ISSUE* – Laporkan masalah\n🆘 *HELP* – Perlukan bantuan`,
+  TAMIL: (job, step, minutes) =>
+    `⏰ *நேர எச்சரிக்கை – வேலை #${job}*\n\n*${step}* க்கு ${minutes} நிமிடங்கள் கொடுக்கப்பட்டது.\n\nநேரம் முடிந்தது! இப்போதே உங்கள் நிலையை தெரிவிக்கவும்:\n✅ *DONE* – வேலை முடிந்தது\n⚠️ *ISSUE* – பிரச்சனை தெரிவிக்கவும்\n🆘 *HELP* – உதவி தேவை`,
 };
 
 function buildMessage(
@@ -555,4 +570,88 @@ export async function handleInboundMessage(
     // Unrecognised — guide the worker
     await sendReply(to, `❓ Unrecognised reply: "${body.trim()}"\n\nPlease reply with:\n✅ *DONE* – Task completed\n⚠️ *ISSUE <details>* – Report a problem\n🆘 *HELP* – Need assistance`, { simulate: options.simulateOutbound });
   }
+}
+
+// ─── Timer Expiry Alert ────────────────────────────────────────────────────────
+// Called by the background timer checker in index.ts.
+// Sends WhatsApp to the assigned worker (in their language) and to the admin.
+// Marks timerAlertSentAt so we only send once per expired timer.
+export async function sendTimerAlert(stepId: string, options: DeliveryOptions = {}): Promise<void> {
+  const step = await prisma.workflowStep.findUnique({
+    where: { id: stepId },
+    include: {
+      job: true,
+      assignedUser: true,
+    },
+  });
+
+  if (!step || !step.assignedUser || !step.timerStartedAt || !step.durationMinutes) return;
+  // Already alerted — skip
+  if (step.timerAlertSentAt) return;
+
+  // Mark alert sent immediately to prevent race conditions
+  await prisma.workflowStep.update({
+    where: { id: stepId },
+    data: { timerAlertSentAt: new Date() },
+  });
+
+  const lang = step.assignedUser.language || 'ENGLISH';
+  const msgFn = TIMER_WORKER_MESSAGES[lang] || TIMER_WORKER_MESSAGES['ENGLISH'];
+  const workerMsg = msgFn(step.job.jobNumber, step.name, step.durationMinutes);
+
+  // Send to worker
+  const workerTo = `whatsapp:${step.assignedUser.phone}`;
+  const client = getClient();
+
+  if (options.simulate || !client) {
+    console.log('[WhatsApp] TIMER ALERT to worker:', workerTo);
+    console.log('[WhatsApp] Message:', workerMsg);
+  } else {
+    try {
+      await client.messages.create({ from, to: workerTo, body: workerMsg });
+    } catch (err) {
+      console.error('[WhatsApp] Timer alert to worker failed:', err);
+    }
+  }
+
+  // Log in DB
+  await prisma.whatsAppMessage.create({
+    data: {
+      jobId: step.jobId,
+      stepId: step.id,
+      userId: step.assignedUserId,
+      direction: 'OUTBOUND',
+      content: workerMsg,
+      status: options.simulate ? 'simulated' : (client ? 'sent' : 'demo_sent'),
+    },
+  });
+
+  // Send to admin
+  const settings = await getSystemSettings();
+  if (settings.notifyAdmin) {
+    const admin = await prisma.user.findFirst({
+      where: { role: 'ADMIN', isActive: true, phone: { not: '' } },
+    });
+    if (admin?.phone) {
+      const adminMsg =
+        `⏰ *Timer Expired – Job #${step.job.jobNumber}*\n\n` +
+        `Step: *${step.name}*\n` +
+        `Worker: ${step.assignedUser.name} (${step.assignedUser.phone})\n` +
+        `Allocated: ${step.durationMinutes} minutes\n\n` +
+        `The worker has been notified via WhatsApp.\n` +
+        `Reply *RESOLVE ${step.job.jobNumber}* if issue is handled.`;
+      await sendReply(`whatsapp:${admin.phone}`, adminMsg, options);
+    }
+  }
+
+  // Broadcast to UI so Timer Monitor page updates in real time
+  broadcastEvent('timer_expired', {
+    jobId: step.jobId,
+    stepId: step.id,
+    jobNumber: step.job.jobNumber,
+    stepName: step.name,
+    workerName: step.assignedUser.name,
+  });
+
+  console.log(`[Timer] Alert sent for step "${step.name}" (Job #${step.job.jobNumber})`);
 }

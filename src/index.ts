@@ -6,6 +6,8 @@ import helmet from 'helmet';
 import morgan from 'morgan';
 import { initWebSocket } from './lib/websocket';
 import { errorHandler, notFound } from './middleware/errorHandler';
+import prisma from './lib/prisma';
+import { sendTimerAlert } from './services/whatsapp';
 
 import dashboardRouter from './routes/dashboard';
 import usersRouter from './routes/users';
@@ -16,6 +18,7 @@ import messagesRouter from './routes/messages';
 import analyticsRouter from './routes/analytics';
 import settingsRouter from './routes/settings';
 import authRouter from './routes/auth';
+import financeRouter from './routes/finance';
 
 const app = express();
 const PORT = process.env.PORT || 4000;
@@ -62,6 +65,7 @@ app.use('/api/workflow-templates', workflowsRouter);
 app.use('/api/messages',           messagesRouter);
 app.use('/api/analytics',          analyticsRouter);
 app.use('/api/settings',           settingsRouter);
+app.use('/api/finance',            financeRouter);
 
 // ─── Error handling ───────────────────────────────────────────────────────────
 app.use(notFound);
@@ -70,6 +74,39 @@ app.use(errorHandler);
 // ─── HTTP + WebSocket server ──────────────────────────────────────────────────
 const server = http.createServer(app);
 initWebSocket(server);
+
+// ─── Background: Timer Expiry Checker ────────────────────────────────────────
+// Runs every 60 seconds. Finds steps whose timer has expired but alert not yet sent.
+// Sends WhatsApp to the assigned worker (in their language) + admin, then marks step.
+async function checkExpiredTimers(): Promise<void> {
+  try {
+    const now = new Date();
+    const expiredSteps = await prisma.workflowStep.findMany({
+      where: {
+        timerStartedAt: { not: null },
+        durationMinutes: { not: null },
+        timerAlertSentAt: null,
+        status: { in: ['IN_PROGRESS', 'NOTIFIED', 'WAITING'] },
+      },
+      select: { id: true, timerStartedAt: true, durationMinutes: true },
+    });
+
+    for (const step of expiredSteps) {
+      if (!step.timerStartedAt || !step.durationMinutes) continue;
+      const expiresAt = new Date(step.timerStartedAt.getTime() + step.durationMinutes * 60 * 1000);
+      if (now >= expiresAt) {
+        await sendTimerAlert(step.id);
+      }
+    }
+  } catch (err) {
+    console.error('[Timer Checker] Error:', err);
+  }
+}
+
+const TIMER_CHECK_INTERVAL_MS = 60_000; // every 1 minute
+setInterval(checkExpiredTimers, TIMER_CHECK_INTERVAL_MS);
+// Run once at startup to catch any timers that expired while server was down
+checkExpiredTimers();
 
 server.listen(PORT, () => {
   console.log(`\n🏗️  Stone Co Backend running on http://localhost:${PORT}`);

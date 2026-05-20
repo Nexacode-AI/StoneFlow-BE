@@ -13,6 +13,8 @@ datasource db {
 enum Role {
   ADMIN
   MANAGER
+  SALESMAN
+  SITE_SUPERVISOR
   CUTTER
   POLISHER
   EDGE_FINISHER
@@ -106,23 +108,28 @@ model Job {
   photos        JobPhoto[]
   messages      WhatsAppMessage[]
   auditLogs     AuditLog[]
+  expenses      JobExpense[]
+  revenue       JobRevenue?
 }
 
 model WorkflowStep {
-  id             String     @id @default(uuid())
-  jobId          String
-  stepNumber     Int
-  name           String
-  description    String?
-  assignedUserId String?
-  status         StepStatus @default(WAITING)
-  startedAt      DateTime?
-  completedAt    DateTime?
-  dueAt          DateTime?
-  notes          String?
-  issueText      String?
-  createdAt      DateTime   @default(now())
-  updatedAt      DateTime   @updatedAt
+  id              String     @id @default(uuid())
+  jobId           String
+  stepNumber      Int
+  name            String
+  description     String?
+  assignedUserId  String?
+  status          StepStatus @default(WAITING)
+  startedAt       DateTime?
+  completedAt     DateTime?
+  dueAt           DateTime?
+  notes           String?
+  issueText       String?
+  durationMinutes Int?
+  timerStartedAt  DateTime?
+  timerAlertSentAt DateTime?
+  createdAt       DateTime   @default(now())
+  updatedAt       DateTime   @updatedAt
 
   job          Job           @relation(fields: [jobId], references: [id], onDelete: Cascade)
   assignedUser User?         @relation(fields: [assignedUserId], references: [id])
@@ -197,5 +204,42 @@ model SystemSettings {
   timezone    String   @default("Asia/Kuala_Lumpur")
   notifyAdmin Boolean  @default(true)
   autoStart   Boolean  @default(false)
+  updatedAt   DateTime @updatedAt
+}
+
+model JobExpense {
+  id        String   @id @default(uuid())
+  jobId     String
+  partName  String
+  partType  String   @default("ORI")
+  quantity  Int      @default(1)
+  amount    Float?
+  pdfStatus String   @default("PENDING")
+  notes     String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  job Job @relation(fields: [jobId], references: [id], onDelete: Cascade)
+}
+
+model JobRevenue {
+  id        String   @id @default(uuid())
+  jobId     String   @unique
+  amount    Float    @default(0)
+  notes     String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  job Job @relation(fields: [jobId], references: [id], onDelete: Cascade)
+}
+
+model PersonalExpense {
+  id          String   @id @default(uuid())
+  description String
+  amount      Float
+  category    String   @default("General")
+  date        DateTime @default(now())
+  notes       String?
+  createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 }

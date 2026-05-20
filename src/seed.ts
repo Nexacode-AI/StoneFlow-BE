@@ -74,20 +74,119 @@ async function seed() {
   // Create workflow template
   await prisma.workflowTemplate.upsert({
     where: { id: 'default-granite-template' },
-    update: {},
-    create: {
-      id: 'default-granite-template',
-      name: 'Standard Granite Countertop',
-      description: 'Full workflow for granite kitchen/bathroom countertop orders',
+    update: {
+      name: 'Standard Stone Fabrication Workflow',
+      description: 'Full factory workflow: 6 fabrication stations → QC → Packing → Delivery → Installation',
       isDefault: true,
       steps: [
-        { stepNumber: 1, name: 'Cutting', description: 'Cut granite slab to measurements' },
-        { stepNumber: 2, name: 'Polishing', description: 'Polish surface to required finish' },
-        { stepNumber: 3, name: 'Edge Finishing', description: 'Shape and finish edges' },
-        { stepNumber: 4, name: 'QC Inspection', description: 'Quality check before packing' },
-        { stepNumber: 5, name: 'Packing', description: 'Wrap and pack for delivery' },
-        { stepNumber: 6, name: 'Loading & Delivery', description: 'Load onto vehicle and deliver' },
-        { stepNumber: 7, name: 'Installation', description: 'Install at customer site, upload photos' },
+        {
+          stepNumber: 1,
+          name: 'Drawing Review & Confirmation',
+          description: 'Factory manager checks measurement drawings from site. Confirms dimensions, edge profiles, and hole openings before production starts.',
+        },
+        {
+          stepNumber: 2,
+          name: 'Bridge Cutter Station',
+          description: 'Cut stone slab into smaller pieces based on confirmed measurements using the bridge saw.',
+        },
+        {
+          stepNumber: 3,
+          name: 'Miter Cutting Station',
+          description: '45° angle cuts on edges as required by the design drawing.',
+        },
+        {
+          stepNumber: 4,
+          name: 'Waterjet Station',
+          description: 'Cut out hole openings for sinks, taps, and other fixtures using the waterjet cutter.',
+        },
+        {
+          stepNumber: 5,
+          name: 'Profiling Station',
+          description: 'Edge joining and edge profiling (bullnose, ogee, bevel, etc.) based on client requirements.',
+        },
+        {
+          stepNumber: 6,
+          name: 'Polishing Station',
+          description: 'Final polishing and finishing on all profiled edges and surfaces.',
+        },
+        {
+          stepNumber: 7,
+          name: 'QC Check & Reporting',
+          description: 'Quality inspection of all cut, joined, and polished surfaces. Upload photos to QC report.',
+        },
+        {
+          stepNumber: 8,
+          name: 'Packing & Loading',
+          description: 'Wrap and protect stone pieces. Load onto delivery vehicle with D/O document.',
+        },
+        {
+          stepNumber: 9,
+          name: 'Delivery',
+          description: 'Deliver to site. Confirm client/site contacts, site condition, and delivery schedule.',
+        },
+        {
+          stepNumber: 10,
+          name: 'Installation',
+          description: 'Install stone at client site. Upload install photos. Complete hand-over form.',
+        },
+      ],
+    },
+    create: {
+      id: 'default-granite-template',
+      name: 'Standard Stone Fabrication Workflow',
+      description: 'Full factory workflow: 6 fabrication stations → QC → Packing → Delivery → Installation',
+      isDefault: true,
+      steps: [
+        {
+          stepNumber: 1,
+          name: 'Drawing Review & Confirmation',
+          description: 'Factory manager checks measurement drawings from site. Confirms dimensions, edge profiles, and hole openings before production starts.',
+        },
+        {
+          stepNumber: 2,
+          name: 'Bridge Cutter Station',
+          description: 'Cut stone slab into smaller pieces based on confirmed measurements using the bridge saw.',
+        },
+        {
+          stepNumber: 3,
+          name: 'Miter Cutting Station',
+          description: '45° angle cuts on edges as required by the design drawing.',
+        },
+        {
+          stepNumber: 4,
+          name: 'Waterjet Station',
+          description: 'Cut out hole openings for sinks, taps, and other fixtures using the waterjet cutter.',
+        },
+        {
+          stepNumber: 5,
+          name: 'Profiling Station',
+          description: 'Edge joining and edge profiling (bullnose, ogee, bevel, etc.) based on client requirements.',
+        },
+        {
+          stepNumber: 6,
+          name: 'Polishing Station',
+          description: 'Final polishing and finishing on all profiled edges and surfaces.',
+        },
+        {
+          stepNumber: 7,
+          name: 'QC Check & Reporting',
+          description: 'Quality inspection of all cut, joined, and polished surfaces. Upload photos to QC report.',
+        },
+        {
+          stepNumber: 8,
+          name: 'Packing & Loading',
+          description: 'Wrap and protect stone pieces. Load onto delivery vehicle with D/O document.',
+        },
+        {
+          stepNumber: 9,
+          name: 'Delivery',
+          description: 'Deliver to site. Confirm client/site contacts, site condition, and delivery schedule.',
+        },
+        {
+          stepNumber: 10,
+          name: 'Installation',
+          description: 'Install stone at client site. Upload install photos. Complete hand-over form.',
+        },
       ],
     },
   });
