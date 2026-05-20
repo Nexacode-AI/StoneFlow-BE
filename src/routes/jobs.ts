@@ -2,6 +2,8 @@ import { Router, Request, Response } from 'express';
 import { z } from 'zod';
 import prisma from '../lib/prisma';
 import { startWorkflow, advanceWorkflow } from '../services/workflow';
+import { broadcastEvent } from '../lib/websocket';
+import { sendRaisedIssueAlert } from '../services/whatsapp';
 
 const router = Router();
 
@@ -284,6 +286,54 @@ router.post('/:id/steps/:stepId/timer/reset', async (req: Request, res: Response
     data: { durationMinutes: null, timerStartedAt: null, timerAlertSentAt: null },
     include: { assignedUser: true },
   });
+  res.json({ success: true, data: step });
+});
+
+// POST /api/jobs/:id/steps/:stepId/raise  – admin raises ISSUE or HELP from dashboard
+const RaiseSchema = z.object({
+  type: z.enum(['ISSUE', 'HELP']),
+  details: z.string().optional(),
+  adminId: z.string().uuid().optional(),
+});
+
+router.post('/:id/steps/:stepId/raise', async (req: Request, res: Response) => {
+  const parsed = RaiseSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ success: false, errors: parsed.error.errors });
+    return;
+  }
+
+  const { type, details, adminId } = parsed.data;
+  const stepId = String(req.params.stepId);
+  const jobId = String(req.params.id);
+  const status = type === 'ISSUE' ? 'ISSUE' : 'HELP_NEEDED';
+  const issueText = details?.trim() || (type === 'ISSUE' ? 'Issue raised from dashboard' : 'Help requested from dashboard');
+
+  const step = await prisma.workflowStep.update({
+    where: { id: stepId },
+    data: { status, issueText },
+    include: { job: true, assignedUser: true },
+  });
+
+  await prisma.auditLog.create({
+    data: {
+      jobId,
+      stepId,
+      userId: adminId ?? null,
+      eventType: type === 'ISSUE' ? 'STEP_ISSUE' : 'STEP_HELP',
+      description: `${type === 'ISSUE' ? 'Issue' : 'Help request'} raised from dashboard on "${step.name}": ${issueText}`,
+    },
+  });
+
+  broadcastEvent(type === 'ISSUE' ? 'step_issue' : 'step_help', { jobId, stepId, details: issueText });
+
+  // Send the same WhatsApp admin alert that fires when a worker reports via WhatsApp.
+  // Uses the notifyAdmin setting — if notifications are disabled in Settings, no WhatsApp is sent.
+  const raisedBy = step.assignedUser
+    ? { name: step.assignedUser.name, phone: step.assignedUser.phone }
+    : null;
+  await sendRaisedIssueAlert(step.job, { id: stepId, name: step.name }, raisedBy, type, issueText);
+
   res.json({ success: true, data: step });
 });
 

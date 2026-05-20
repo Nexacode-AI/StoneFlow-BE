@@ -208,7 +208,7 @@ async function handleAdminMessage(
   const text = body.trim();
 
   // RESOLVE J001 — admin resolves an open issue
-  const resolveMatch = text.match(/^RESOLVE\s+([A-Z0-9]+)/i);
+  const resolveMatch = text.match(/^RESOLVE\s+([A-Z0-9][A-Z0-9-]*)/i);
   if (resolveMatch) {
     const jobNumber = resolveMatch[1].toUpperCase();
     const job = await prisma.job.findFirst({ where: { jobNumber } });
@@ -250,7 +250,7 @@ async function handleAdminMessage(
   }
 
   // J001: message — admin replies to a worker
-  const replyMatch = text.match(/^([A-Z0-9]+):\s*(.+)/is);
+  const replyMatch = text.match(/^([A-Z0-9][A-Z0-9-]*):\s*(.+)/is);
   if (replyMatch) {
     const jobNumber = replyMatch[1].toUpperCase();
     const message = replyMatch[2].trim();
@@ -476,6 +476,19 @@ export async function handleAdminMessageById(adminId: string, text: string): Pro
   await handleAdminMessage(admin, text, `ui-${Date.now()}`);
 }
 
+// Called from the dashboard /raise endpoint — sends the same admin alert WhatsApp
+// as when a worker replies ISSUE/HELP via WhatsApp.
+export async function sendRaisedIssueAlert(
+  job: { id: string; jobNumber: string; title: string },
+  step: { id: string; name: string },
+  raisedBy: { name: string; phone: string } | null,
+  type: 'ISSUE' | 'HELP',
+  details: string,
+): Promise<void> {
+  const workerInfo = raisedBy ?? { name: 'Admin', phone: '' };
+  await notifyAdmin(job, step, workerInfo, type, details);
+}
+
 export async function handleInboundMessage(
   from: string,
   body: string,
@@ -492,22 +505,25 @@ export async function handleInboundMessage(
     return;
   }
 
-  // Admin messages are routed to the two-way relay handler
-  if (user.role === 'ADMIN') {
-    await handleAdminMessage(user, body, waMessageId);
-    return;
-  }
-
   const activeStep = await prisma.workflowStep.findFirst({
     where: {
       assignedUserId: user.id,
-      status: { in: ['NOTIFIED', 'IN_PROGRESS'] },
+      // Include ISSUE/HELP_NEEDED so workers can escalate or change their alert type
+      status: { in: ['NOTIFIED', 'IN_PROGRESS', 'ISSUE', 'HELP_NEEDED'] },
     },
     include: { job: true },
     orderBy: { stepNumber: 'asc' },
   });
 
-  if (!activeStep) {
+  // Admin messages: if admin has an active assigned step AND sends a worker command,
+  // process as worker. Otherwise route to admin relay handler.
+  if (user.role === 'ADMIN') {
+    const isWorkerCommand = text === 'DONE' || text.startsWith('ISSUE') || text.startsWith('HELP');
+    if (!activeStep || !isWorkerCommand) {
+      await handleAdminMessage(user, body, waMessageId);
+      return;
+    }
+  } else if (!activeStep) {
     console.warn('[WhatsApp] No active step for user:', user.name);
     return;
   }
