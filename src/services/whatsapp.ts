@@ -4,7 +4,10 @@ import { broadcastEvent } from '../lib/websocket';
 
 const accountSid = process.env.TWILIO_ACCOUNT_SID || '';
 const authToken = process.env.TWILIO_AUTH_TOKEN || '';
-const from = process.env.TWILIO_WHATSAPP_FROM || 'whatsapp:+14155238886';
+// Read FROM lazily so a late .env edit / restart still applies
+function getFrom(): string {
+  return process.env.TWILIO_WHATSAPP_FROM || 'whatsapp:+14155238886';
+}
 
 let twilioClient: ReturnType<typeof twilio> | null = null;
 
@@ -12,11 +15,56 @@ type DeliveryOptions = {
   simulate?: boolean;
 };
 
+export type DeliveryResult = {
+  status: 'sent' | 'failed' | 'simulated' | 'demo_sent';
+  sid?: string;
+  errorCode?: string | number;
+  errorMessage?: string;
+  to?: string;
+};
+
 function getClient() {
   if (!twilioClient && accountSid && authToken) {
     twilioClient = twilio(accountSid, authToken);
   }
   return twilioClient;
+}
+
+// Normalize "whatsapp:+..." — strip non-digits (except leading +) inside the number portion
+function normalizeWhatsAppTo(phone: string): string {
+  const p = (phone || '').trim();
+  const num = p.startsWith('whatsapp:') ? p.slice('whatsapp:'.length) : p;
+  const hasPlus = num.startsWith('+');
+  const digits = num.replace(/[^\d]/g, '');
+  return `whatsapp:${hasPlus ? '+' : '+'}${digits}`;
+}
+
+function extractTwilioError(err: unknown): { code?: string | number; message: string } {
+  const e = err as { code?: string | number; status?: number; message?: string; moreInfo?: string };
+  const code = e?.code ?? e?.status;
+  const message = e?.message || (typeof err === 'string' ? err : 'Unknown WhatsApp send error');
+  return { code, message };
+}
+
+function humanizeTwilioError(code: string | number | undefined, message: string): string {
+  const c = String(code ?? '');
+  // Sandbox window expired — most common cause
+  if (c === '63016') {
+    return 'Recipient is outside the 24-hour Twilio Sandbox window. Ask them to WhatsApp "join <your-sandbox-code>" to +1 415 523 8886 again, then retry.';
+  }
+  if (c === '63007') {
+    return 'TWILIO_WHATSAPP_FROM does not match any approved sender on this Twilio account. Check the value in backend/.env.';
+  }
+  if (c === '21211' || c === '21614') {
+    return 'Invalid "To" phone number format. Use international format like +60123456789.';
+  }
+  if (c === '20003') {
+    return 'Twilio authentication failed. Check TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN in backend/.env.';
+  }
+  if (c === '63015' || c === '63018') {
+    return 'Recipient has not joined your Twilio WhatsApp Sandbox. They must send "join <code>" to +1 415 523 8886 first.';
+  }
+  return message;
 }
 
 async function getSystemSettings() {
@@ -78,7 +126,7 @@ function buildMessage(
   return fn(jobNumber, stepName, description || '');
 }
 
-export async function sendStepNotification(stepId: string, options: DeliveryOptions = {}): Promise<void> {
+export async function sendStepNotification(stepId: string, options: DeliveryOptions = {}): Promise<DeliveryResult> {
   const step = await prisma.workflowStep.findUnique({
     where: { id: stepId },
     include: {
@@ -89,7 +137,7 @@ export async function sendStepNotification(stepId: string, options: DeliveryOpti
 
   if (!step || !step.assignedUser) {
     console.warn('[WhatsApp] Step or user not found:', stepId);
-    return;
+    return { status: 'failed', errorMessage: 'Step or assigned user not found' };
   }
 
   const message = buildMessage(
@@ -99,11 +147,13 @@ export async function sendStepNotification(stepId: string, options: DeliveryOpti
     step.description || '',
   );
 
-  const to = `whatsapp:${step.assignedUser.phone}`;
+  const to = normalizeWhatsAppTo(step.assignedUser.phone);
   const client = getClient();
+  const from = getFrom();
 
   if (options.simulate || !client) {
-    console.log(options.simulate ? '[WhatsApp] SIMULATION – Would send to:' : '[WhatsApp] DEMO MODE – Would send to:', to);
+    const mode = options.simulate ? 'SIMULATION' : 'DEMO MODE';
+    console.log(`[WhatsApp] ${mode} – Would send to:`, to);
     console.log('[WhatsApp] Message:', message);
     await prisma.whatsAppMessage.create({
       data: {
@@ -115,7 +165,7 @@ export async function sendStepNotification(stepId: string, options: DeliveryOpti
         status: options.simulate ? 'simulated' : 'demo_sent',
       },
     });
-    return;
+    return { status: options.simulate ? 'simulated' : 'demo_sent', to };
   }
 
   try {
@@ -131,39 +181,53 @@ export async function sendStepNotification(stepId: string, options: DeliveryOpti
         status: 'sent',
       },
     });
-    console.log('[WhatsApp] Sent SID:', result.sid);
+    console.log('[WhatsApp] Sent SID:', result.sid, 'to', to);
+    return { status: 'sent', sid: result.sid, to };
   } catch (err) {
-    console.error('[WhatsApp] Send error:', err);
-    // Save as failed — do NOT throw. Workflow must continue regardless of WhatsApp errors.
+    const { code, message: rawMsg } = extractTwilioError(err);
+    const reason = humanizeTwilioError(code, rawMsg);
+    console.error(`[WhatsApp] Send FAILED to ${to} (code=${code}): ${rawMsg}`);
+    console.error('   →', reason);
     await prisma.whatsAppMessage.create({
       data: {
         jobId: step.jobId,
         stepId: step.id,
         userId: step.assignedUserId,
         direction: 'OUTBOUND',
-        content: message,
+        content: `[FAILED code=${code ?? 'n/a'}] ${reason}\n\n----- original -----\n${message}`,
         status: 'failed',
       },
     });
+    broadcastEvent('whatsapp_failed', {
+      jobId: step.jobId,
+      stepId: step.id,
+      to,
+      code,
+      reason,
+    });
+    return { status: 'failed', errorCode: code, errorMessage: reason, to };
   }
 }
 
 // Send a plain text reply back to a WhatsApp number (fire-and-forget, never throws)
 async function sendReply(to: string, message: string, options: DeliveryOptions = {}): Promise<void> {
+  const target = normalizeWhatsAppTo(to);
   if (options.simulate) {
-    console.log('[WhatsApp] SIMULATED REPLY to', to, ':', message);
+    console.log('[WhatsApp] SIMULATED REPLY to', target, ':', message);
     return;
   }
 
   const client = getClient();
   if (!client) {
-    console.log('[WhatsApp] DEMO REPLY to', to, ':', message);
+    console.log('[WhatsApp] DEMO REPLY to', target, ':', message);
     return;
   }
   try {
-    await client.messages.create({ from, to, body: message });
+    await client.messages.create({ from: getFrom(), to: target, body: message });
   } catch (err) {
-    console.error('[WhatsApp] Reply send error:', err);
+    const { code, message: rawMsg } = extractTwilioError(err);
+    console.error(`[WhatsApp] Reply send error to ${target} (code=${code}): ${rawMsg}`);
+    console.error('   →', humanizeTwilioError(code, rawMsg));
   }
 }
 
@@ -495,13 +559,30 @@ export async function handleInboundMessage(
   waMessageId: string,
   options: { simulateOutbound?: boolean } = {},
 ): Promise<void> {
-  const phone = from.replace('whatsapp:', '');
-  const to = `whatsapp:${phone}`;   // used for sending replies back
+  // Twilio sends From like "whatsapp:+94779705375". Strip prefix + any whitespace.
+  const rawPhone = from.replace(/^whatsapp:/i, '').trim();
+  // Normalise to strict +<digits> for lookup (handles legacy records with spaces/dashes)
+  const digitsOnly = rawPhone.replace(/[^\d]/g, '');
+  const normalized = `+${digitsOnly}`;
+  const to = `whatsapp:${normalized}`; // used for sending replies back
   const text = body.trim().toUpperCase();
 
-  const user = await prisma.user.findUnique({ where: { phone } });
+  console.log(`[WhatsApp/Inbound] from=${from} normalized=${normalized} body="${body}"`);
+
+  // Try exact match first, then a digits-only fallback in case the stored phone
+  // has spaces/dashes from before phone normalisation was added.
+  let user = await prisma.user.findUnique({ where: { phone: normalized } });
   if (!user) {
-    console.warn('[WhatsApp] Unknown sender:', phone);
+    const candidates = await prisma.user.findMany();
+    user = candidates.find((u) => u.phone.replace(/[^\d]/g, '') === digitsOnly) ?? null;
+  }
+  if (!user) {
+    console.warn('[WhatsApp/Inbound] Unknown sender:', normalized, '— not in users table.');
+    await sendReply(
+      to,
+      `❓ Your number (${normalized}) is not registered in the system. Please contact the admin to be added as a team member.`,
+      { simulate: options.simulateOutbound },
+    );
     return;
   }
 
@@ -524,7 +605,12 @@ export async function handleInboundMessage(
       return;
     }
   } else if (!activeStep) {
-    console.warn('[WhatsApp] No active step for user:', user.name);
+    console.warn(`[WhatsApp/Inbound] No active step for ${user.name} (${normalized}).`);
+    await sendReply(
+      to,
+      `ℹ️ Hi ${user.name}, you currently have no active task assigned. Please wait for the admin to start a workflow that includes you.`,
+      { simulate: options.simulateOutbound },
+    );
     return;
   }
 
@@ -616,7 +702,7 @@ export async function sendTimerAlert(stepId: string, options: DeliveryOptions = 
   const workerMsg = msgFn(step.job.jobNumber, step.name, step.durationMinutes);
 
   // Send to worker
-  const workerTo = `whatsapp:${step.assignedUser.phone}`;
+  const workerTo = normalizeWhatsAppTo(step.assignedUser.phone);
   const client = getClient();
 
   if (options.simulate || !client) {
@@ -624,9 +710,10 @@ export async function sendTimerAlert(stepId: string, options: DeliveryOptions = 
     console.log('[WhatsApp] Message:', workerMsg);
   } else {
     try {
-      await client.messages.create({ from, to: workerTo, body: workerMsg });
+      await client.messages.create({ from: getFrom(), to: workerTo, body: workerMsg });
     } catch (err) {
-      console.error('[WhatsApp] Timer alert to worker failed:', err);
+      const { code, message: rawMsg } = extractTwilioError(err);
+      console.error(`[WhatsApp] Timer alert to worker failed (code=${code}): ${rawMsg}`);
     }
   }
 
@@ -670,4 +757,35 @@ export async function sendTimerAlert(stepId: string, options: DeliveryOptions = 
   });
 
   console.log(`[Timer] Alert sent for step "${step.name}" (Job #${step.job.jobNumber})`);
+}
+
+// ─── Diagnostic test message ──────────────────────────────────────────────────
+// Used by POST /api/webhooks/test to verify Twilio sandbox setup end-to-end.
+// Returns a DeliveryResult so the UI can show the exact Twilio error if any.
+export async function sendTestMessage(rawPhone: string, customBody?: string): Promise<DeliveryResult> {
+  const to = normalizeWhatsAppTo(rawPhone);
+  const body =
+    customBody?.trim() ||
+    `🧪 *Stone Co – WhatsApp Test*\n\nIf you can read this, your Twilio Sandbox + ngrok webhook are wired correctly.\n\nReply *DONE* to confirm two-way delivery.`;
+
+  const client = getClient();
+  if (!client) {
+    return {
+      status: 'demo_sent',
+      to,
+      errorMessage: 'TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN are missing in backend/.env — running in DEMO mode.',
+    };
+  }
+  try {
+    const result = await client.messages.create({ from: getFrom(), to, body });
+    return { status: 'sent', sid: result.sid, to };
+  } catch (err) {
+    const { code, message: rawMsg } = extractTwilioError(err);
+    return {
+      status: 'failed',
+      to,
+      errorCode: code,
+      errorMessage: humanizeTwilioError(code, rawMsg),
+    };
+  }
 }

@@ -1,22 +1,27 @@
 import prisma from '../lib/prisma';
 import { broadcastEvent } from '../lib/websocket';
-import { sendStepNotification } from './whatsapp';
+import { sendStepNotification, DeliveryResult } from './whatsapp';
 
 type WorkflowDispatchOptions = {
   simulateOutbound?: boolean;
+};
+
+export type WorkflowStartResult = {
+  firstStepId: string;
+  notification: DeliveryResult | null;
 };
 
 export async function advanceWorkflow(
   jobId: string,
   completedStepId: string,
   options: WorkflowDispatchOptions = {},
-): Promise<void> {
+): Promise<DeliveryResult | null> {
   const completedStep = await prisma.workflowStep.findUnique({
     where: { id: completedStepId },
     include: { job: true },
   });
 
-  if (!completedStep) return;
+  if (!completedStep) return null;
 
   await prisma.workflowStep.update({
     where: { id: completedStepId },
@@ -61,7 +66,7 @@ export async function advanceWorkflow(
       },
     });
     broadcastEvent('job_completed', { jobId });
-    return;
+    return null;
   }
 
   await prisma.workflowStep.update({
@@ -72,11 +77,12 @@ export async function advanceWorkflow(
   broadcastEvent('step_started', { jobId, stepId: nextStep.id, stepNumber: nextStep.stepNumber });
 
   if (nextStep.assignedUserId) {
-    await sendStepNotification(nextStep.id, { simulate: options.simulateOutbound });
+    return await sendStepNotification(nextStep.id, { simulate: options.simulateOutbound });
   }
+  return null;
 }
 
-export async function startWorkflow(jobId: string, options: WorkflowDispatchOptions = {}): Promise<void> {
+export async function startWorkflow(jobId: string, options: WorkflowDispatchOptions = {}): Promise<WorkflowStartResult> {
   const job = await prisma.job.findUnique({
     where: { id: jobId },
     include: { workflowSteps: { orderBy: { stepNumber: 'asc' } } },
@@ -108,7 +114,9 @@ export async function startWorkflow(jobId: string, options: WorkflowDispatchOpti
 
   broadcastEvent('workflow_started', { jobId, firstStepId: firstStep.id });
 
+  let notification: DeliveryResult | null = null;
   if (firstStep.assignedUserId) {
-    await sendStepNotification(firstStep.id, { simulate: options.simulateOutbound });
+    notification = await sendStepNotification(firstStep.id, { simulate: options.simulateOutbound });
   }
+  return { firstStepId: firstStep.id, notification };
 }

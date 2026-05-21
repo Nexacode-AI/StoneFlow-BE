@@ -4,9 +4,29 @@ import prisma from '../lib/prisma';
 
 const router = Router();
 
+// Normalize a phone number to strict E.164: leading '+' followed by digits only.
+// Strips spaces, dashes, parentheses, dots. Accepts "00<cc>..." → "+<cc>...".
+export function normalizePhone(raw: string): string {
+  let p = (raw || '').trim();
+  if (!p) return p;
+  // strip everything except digits and a leading '+'
+  const hasPlus = p.startsWith('+');
+  p = p.replace(/[^\d]/g, '');
+  if (!hasPlus && p.startsWith('00')) p = p.slice(2);
+  return '+' + p;
+}
+
+const PHONE_REGEX = /^\+\d{7,15}$/;
+
 const CreateUserSchema = z.object({
   name: z.string().min(2),
-  phone: z.string().min(7),
+  phone: z
+    .string()
+    .min(7)
+    .transform((v) => normalizePhone(v))
+    .refine((v) => PHONE_REGEX.test(v), {
+      message: 'Phone must be in international format like +60123456789 (digits only, no spaces).',
+    }),
   email: z.string().email().optional(),
   role: z.enum([
     'ADMIN', 'MANAGER', 'CUTTER', 'POLISHER', 'EDGE_FINISHER',

@@ -1,5 +1,7 @@
 import { Router, Request, Response } from 'express';
-import { handleInboundMessage } from '../services/whatsapp';
+import express from 'express';
+import { handleInboundMessage, sendTestMessage } from '../services/whatsapp';
+import prisma from '../lib/prisma';
 
 const router = Router();
 
@@ -46,7 +48,7 @@ router.post('/whatsapp', async (req: Request, res: Response) => {
 
 // POST /api/webhooks/simulate  – Simulate inbound worker reply (for dev/testing)
 // Body: { phone: "+601...", message: "DONE" | "ISSUE ..." | "HELP" }
-router.post('/simulate', async (req: Request, res: Response) => {
+router.post('/simulate', express.json(), async (req: Request, res: Response) => {
   try {
     const { phone, message } = req.body as { phone?: string; message?: string };
     if (!phone || !message) {
@@ -60,6 +62,61 @@ router.post('/simulate', async (req: Request, res: Response) => {
     const msg = err instanceof Error ? err.message : 'Unknown error';
     res.status(500).json({ success: false, message: msg });
   }
+});
+
+// POST /api/webhooks/test  – Diagnostic: send a real WhatsApp test to a phone or userId
+// Body: { phone?: "+947...", userId?: "uuid", message?: "..." }
+// Returns: { success, delivery: { status, sid?, errorCode?, errorMessage?, to } }
+router.post('/test', express.json(), async (req: Request, res: Response) => {
+  try {
+    const { phone: rawPhone, userId, message } = req.body as {
+      phone?: string;
+      userId?: string;
+      message?: string;
+    };
+
+    let phone = rawPhone;
+    if (!phone && userId) {
+      const u = await prisma.user.findUnique({ where: { id: userId } });
+      if (!u) {
+        res.status(404).json({ success: false, message: 'User not found' });
+        return;
+      }
+      phone = u.phone;
+    }
+    if (!phone) {
+      res.status(400).json({ success: false, message: 'Provide either "phone" or "userId".' });
+      return;
+    }
+
+    const delivery = await sendTestMessage(phone, message);
+    const httpStatus = delivery.status === 'failed' ? 200 : 200; // always 200; status is in body
+    res.status(httpStatus).json({
+      success: delivery.status === 'sent' || delivery.status === 'demo_sent',
+      delivery,
+      config: {
+        from: process.env.TWILIO_WHATSAPP_FROM || 'whatsapp:+14155238886',
+        hasSid: !!process.env.TWILIO_ACCOUNT_SID,
+        hasToken: !!process.env.TWILIO_AUTH_TOKEN,
+      },
+    });
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : 'Unknown error';
+    res.status(500).json({ success: false, message: msg });
+  }
+});
+
+// GET /api/webhooks/config  – Quick health check of Twilio env config
+router.get('/config', (_req: Request, res: Response) => {
+  res.json({
+    success: true,
+    data: {
+      from: process.env.TWILIO_WHATSAPP_FROM || 'whatsapp:+14155238886',
+      hasSid: !!process.env.TWILIO_ACCOUNT_SID,
+      hasToken: !!process.env.TWILIO_AUTH_TOKEN,
+      verifyTokenSet: !!process.env.WHATSAPP_VERIFY_TOKEN,
+    },
+  });
 });
 
 export default router;

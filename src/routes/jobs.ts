@@ -210,8 +210,21 @@ router.patch('/:id/status', async (req: Request, res: Response) => {
 // POST /api/jobs/:id/start
 router.post('/:id/start', async (req: Request, res: Response) => {
   try {
-    await startWorkflow(String(req.params.id));
-    res.json({ success: true, message: 'Workflow started' });
+    const result = await startWorkflow(String(req.params.id));
+    const notification = result.notification;
+    if (notification && notification.status === 'failed') {
+      res.status(200).json({
+        success: true,
+        message: 'Workflow started, but the first WhatsApp notification failed.',
+        notification,
+      });
+      return;
+    }
+    res.json({
+      success: true,
+      message: 'Workflow started',
+      notification,
+    });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     res.status(500).json({ success: false, message: `Failed to start workflow: ${msg}` });
@@ -221,8 +234,12 @@ router.post('/:id/start', async (req: Request, res: Response) => {
 // POST /api/jobs/:id/steps/:stepId/complete
 router.post('/:id/steps/:stepId/complete', async (req: Request, res: Response) => {
   try {
-    await advanceWorkflow(String(req.params.id), String(req.params.stepId));
-    res.json({ success: true, message: 'Step completed, next step notified' });
+    const notification = await advanceWorkflow(String(req.params.id), String(req.params.stepId));
+    res.json({
+      success: true,
+      message: 'Step completed, next step notified',
+      notification,
+    });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     res.status(500).json({ success: false, message: `Failed to advance workflow: ${msg}` });
