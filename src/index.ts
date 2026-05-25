@@ -19,6 +19,7 @@ import analyticsRouter from './routes/analytics';
 import settingsRouter from './routes/settings';
 import authRouter from './routes/auth';
 import financeRouter from './routes/finance';
+import clientRouter from './routes/client';
 
 const app = express();
 const PORT = process.env.PORT || 4000;
@@ -56,6 +57,7 @@ app.get('/health', (_req, res) => res.json({ status: 'ok', ts: new Date().toISOS
 // Public routes
 app.use('/api/auth',     authRouter);
 app.use('/api/webhooks', webhooksRouter);
+app.use('/api/client',   clientRouter);  // client portal — public GET, admin-guarded POST/DELETE
 
 // API routes (internal tool – protected at frontend)
 app.use('/api/dashboard',          dashboardRouter);
