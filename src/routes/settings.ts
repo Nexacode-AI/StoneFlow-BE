@@ -15,21 +15,23 @@ router.get('/', async (_req: Request, res: Response) => {
 
 // PATCH /api/settings — update settings
 router.patch('/', async (req: Request, res: Response) => {
-  const { companyName, timezone, notifyAdmin, autoStart } = req.body;
+  const { companyName, timezone, notifyAdmin, autoStart, autoStartOnDate } = req.body;
   const settings = await prisma.systemSettings.upsert({
     where: { id: 'singleton' },
     create: {
       id: 'singleton',
-      ...(companyName  !== undefined && { companyName }),
-      ...(timezone     !== undefined && { timezone }),
-      ...(notifyAdmin  !== undefined && { notifyAdmin }),
-      ...(autoStart    !== undefined && { autoStart }),
+      ...(companyName      !== undefined && { companyName }),
+      ...(timezone         !== undefined && { timezone }),
+      ...(notifyAdmin      !== undefined && { notifyAdmin }),
+      ...(autoStart        !== undefined && { autoStart }),
+      ...(autoStartOnDate  !== undefined && { autoStartOnDate }),
     },
     update: {
-      ...(companyName  !== undefined && { companyName }),
-      ...(timezone     !== undefined && { timezone }),
-      ...(notifyAdmin  !== undefined && { notifyAdmin }),
-      ...(autoStart    !== undefined && { autoStart }),
+      ...(companyName      !== undefined && { companyName }),
+      ...(timezone         !== undefined && { timezone }),
+      ...(notifyAdmin      !== undefined && { notifyAdmin }),
+      ...(autoStart        !== undefined && { autoStart }),
+      ...(autoStartOnDate  !== undefined && { autoStartOnDate }),
     },
   });
   res.json({ success: true, data: settings });

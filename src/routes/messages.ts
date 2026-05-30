@@ -58,6 +58,24 @@ router.post('/reply-step', async (req: Request, res: Response) => {
   }
 });
 
+// POST /api/messages/reply-subtask — admin replies to a sub-task worker
+// body: { subTaskId, adminId, message }
+router.post('/reply-subtask', async (req: Request, res: Response) => {
+  const { subTaskId, adminId, message } = req.body as { subTaskId: string; adminId: string; message: string };
+  if (!subTaskId || !adminId || !message?.trim()) {
+    res.status(400).json({ success: false, message: 'subTaskId, adminId and message required' });
+    return;
+  }
+  try {
+    const { sendAdminReplyToSubTask } = await import('../services/whatsapp');
+    const result = await sendAdminReplyToSubTask(subTaskId, adminId, message.trim());
+    res.json({ success: true, data: result });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : 'Unknown error';
+    res.status(500).json({ success: false, message: msg });
+  }
+});
+
 // POST /api/messages/resolve-step — admin resolves an issue on a specific step
 // body: { stepId, adminId }
 router.post('/resolve-step', async (req: Request, res: Response) => {
@@ -69,6 +87,24 @@ router.post('/resolve-step', async (req: Request, res: Response) => {
   try {
     const { resolveStepById } = await import('../services/whatsapp');
     const result = await resolveStepById(stepId, adminId);
+    res.json({ success: true, data: result });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : 'Unknown error';
+    res.status(500).json({ success: false, message: msg });
+  }
+});
+
+// POST /api/messages/resolve-subtask — admin resolves an issue on a sub-task
+// body: { subTaskId, adminId }
+router.post('/resolve-subtask', async (req: Request, res: Response) => {
+  const { subTaskId, adminId } = req.body as { subTaskId: string; adminId: string };
+  if (!subTaskId || !adminId) {
+    res.status(400).json({ success: false, message: 'subTaskId and adminId required' });
+    return;
+  }
+  try {
+    const { resolveSubTaskById } = await import('../services/whatsapp');
+    const result = await resolveSubTaskById(subTaskId, adminId);
     res.json({ success: true, data: result });
   } catch (err) {
     const msg = err instanceof Error ? err.message : 'Unknown error';

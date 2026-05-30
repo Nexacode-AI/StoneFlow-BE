@@ -69,6 +69,64 @@ router.get('/', async (_req: Request, res: Response) => {
       })
     : [];
 
+  // Sub-task alerts: sub-tasks with an issueText that are not yet completed
+  const rawSubTaskAlerts = settings.notifyAdmin
+    ? await prisma.workflowSubTask.findMany({
+        where: {
+          issueText: { not: null },
+          status: { in: ['WAITING', 'NOTIFIED'] },
+        },
+        include: {
+          step: { include: { job: { select: { id: true, jobNumber: true, title: true } } } },
+          assignedUser: { select: { id: true, name: true, phone: true } },
+        },
+        orderBy: { updatedAt: 'desc' },
+        take: 50,
+      })
+    : [];
+
+  // Determine ISSUE vs HELP_NEEDED for each sub-task via audit log
+  const subTaskStepIds = [...new Set(rawSubTaskAlerts.map((st) => st.stepId))];
+  const subTaskAuditLogs = subTaskStepIds.length > 0
+    ? await prisma.auditLog.findMany({
+        where: {
+          eventType: { in: ['SUBTASK_ISSUE', 'SUBTASK_HELP'] },
+          stepId: { in: subTaskStepIds },
+        },
+        orderBy: { createdAt: 'desc' },
+        take: 200,
+      })
+    : [];
+
+  // Build map: subTaskId → 'ISSUE' | 'HELP_NEEDED' from most recent audit event
+  const subTaskStatusMap = new Map<string, 'ISSUE' | 'HELP_NEEDED'>();
+  for (const log of subTaskAuditLogs) {
+    for (const st of rawSubTaskAlerts) {
+      if (!subTaskStatusMap.has(st.id) && log.stepId === st.stepId &&
+          log.description.toLowerCase().includes(st.title.toLowerCase())) {
+        subTaskStatusMap.set(st.id, log.eventType === 'SUBTASK_ISSUE' ? 'ISSUE' : 'HELP_NEEDED');
+        break;
+      }
+    }
+  }
+
+  const subTaskAlerts = rawSubTaskAlerts.map((st) => ({
+    id: st.id,
+    name: `${st.step.name} › ${st.title}`,
+    status: (subTaskStatusMap.get(st.id) ?? 'ISSUE') as 'ISSUE' | 'HELP_NEEDED',
+    issueText: st.issueText,
+    updatedAt: st.updatedAt.toISOString(),
+    job: st.step.job,
+    assignedUser: st.assignedUser ?? undefined,
+    isSubTask: true,
+    stepId: st.stepId,
+  }));
+
+  // Merge step + sub-task alerts, sorted newest first
+  const allAlerts = [...alertSteps.map(s => ({ ...s, isSubTask: false })), ...subTaskAlerts]
+    .sort((a, b) => new Date((b as { updatedAt: string | Date }).updatedAt).getTime() - new Date((a as { updatedAt: string | Date }).updatedAt).getTime())
+    .slice(0, 50);
+
   const recentActivity = await prisma.auditLog.findMany({
     take: 10,
     orderBy: { createdAt: 'desc' },
@@ -86,12 +144,12 @@ router.get('/', async (_req: Request, res: Response) => {
         upcomingJobs,
         totalUsers,
         overdueJobs,
-        alertCount: alertSteps.length,
+        alertCount: allAlerts.length,
       },
       jobsByStatus,
       recentJobs,
       recentActivity,
-      alertSteps,
+      alertSteps: allAlerts,
     },
   });
 });

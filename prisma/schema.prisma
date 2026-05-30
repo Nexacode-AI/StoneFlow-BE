@@ -64,6 +64,12 @@ enum MessageDirection {
   INBOUND
 }
 
+enum SubTaskStatus {
+  WAITING
+  NOTIFIED
+  COMPLETED
+}
+
 // ─── Models ───────────────────────────────────────────────────────────────────
 
 model User {
@@ -78,10 +84,11 @@ model User {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  assignedSteps WorkflowStep[]
-  messages      WhatsAppMessage[]
-  photos        JobPhoto[]
-  auditLogs     AuditLog[]
+  assignedSteps    WorkflowStep[]
+  assignedSubTasks WorkflowSubTask[]
+  messages         WhatsAppMessage[]
+  photos           JobPhoto[]
+  auditLogs        AuditLog[]
 }
 
 model Job {
@@ -94,6 +101,7 @@ model Job {
   measurements String?
   material     String?
   color        String?
+  startDate    DateTime?
   deadline     DateTime
   status       JobStatus @default(PENDING)
   priority     Priority  @default(NORMAL)
@@ -136,8 +144,30 @@ model WorkflowStep {
   messages     WhatsAppMessage[]
   photos       JobPhoto[]
   auditLogs    AuditLog[]
+  subTasks     WorkflowSubTask[]
 
   @@unique([jobId, stepNumber])
+}
+
+model WorkflowSubTask {
+  id               String        @id @default(uuid())
+  stepId           String
+  title            String
+  description      String?
+  assignedUserId   String?
+  dueAt            DateTime?
+  isCompleted      Boolean       @default(false)
+  status           SubTaskStatus @default(WAITING)
+  order            Int           @default(0)
+  issueText        String?
+  durationMinutes  Int?
+  timerStartedAt   DateTime?
+  timerAlertSentAt DateTime?
+  createdAt        DateTime      @default(now())
+  updatedAt        DateTime      @updatedAt
+
+  step         WorkflowStep @relation(fields: [stepId], references: [id], onDelete: Cascade)
+  assignedUser User?        @relation(fields: [assignedUserId], references: [id])
 }
 
 model WhatsAppMessage {
@@ -199,12 +229,13 @@ model WorkflowTemplate {
 }
 
 model SystemSettings {
-  id          String   @id @default("singleton")
-  companyName String   @default("Stone Co Sdn Bhd")
-  timezone    String   @default("Asia/Kuala_Lumpur")
-  notifyAdmin Boolean  @default(true)
-  autoStart   Boolean  @default(false)
-  updatedAt   DateTime @updatedAt
+  id               String   @id @default("singleton")
+  companyName      String   @default("Stone Co Sdn Bhd")
+  timezone         String   @default("Asia/Kuala_Lumpur")
+  notifyAdmin      Boolean  @default(true)
+  autoStart        Boolean  @default(false)
+  autoStartOnDate  Boolean  @default(false)
+  updatedAt        DateTime @updatedAt
 }
 
 model JobExpense {

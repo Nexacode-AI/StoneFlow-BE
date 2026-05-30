@@ -209,6 +209,88 @@ export async function sendStepNotification(stepId: string, options: DeliveryOpti
   }
 }
 
+// Send a WhatsApp notification for a specific sub-task
+export async function sendSubTaskNotification(subTaskId: string, options: DeliveryOptions = {}): Promise<DeliveryResult> {
+  const subTask = await prisma.workflowSubTask.findUnique({
+    where: { id: subTaskId },
+    include: {
+      step: {
+        include: { job: true },
+      },
+    },
+  });
+
+  if (!subTask || !subTask.assignedUserId) {
+    console.warn('[WhatsApp] Sub-task or assigned user not found:', subTaskId);
+    return { status: 'failed', errorMessage: 'Sub-task or assigned user not found' };
+  }
+
+  const assignedUser = await prisma.user.findUnique({ where: { id: subTask.assignedUserId } });
+  if (!assignedUser) {
+    return { status: 'failed', errorMessage: 'Assigned user not found' };
+  }
+
+  const message = buildMessage(
+    assignedUser.language,
+    subTask.step.job.jobNumber,
+    `${subTask.step.name} › ${subTask.title}`,
+    subTask.description || '',
+  );
+
+  const to = normalizeWhatsAppTo(assignedUser.phone);
+  const client = getClient();
+  const from = getFrom();
+
+  if (options.simulate || !client) {
+    const mode = options.simulate ? 'SIMULATION' : 'DEMO MODE';
+    console.log(`[WhatsApp] ${mode} – Sub-task notify to:`, to);
+    console.log('[WhatsApp] Message:', message);
+    await prisma.whatsAppMessage.create({
+      data: {
+        jobId: subTask.step.jobId,
+        stepId: subTask.stepId,
+        userId: subTask.assignedUserId,
+        direction: 'OUTBOUND',
+        content: message,
+        status: options.simulate ? 'simulated' : 'demo_sent',
+      },
+    });
+    return { status: options.simulate ? 'simulated' : 'demo_sent', to };
+  }
+
+  try {
+    const result = await client.messages.create({ from, to, body: message });
+    await prisma.whatsAppMessage.create({
+      data: {
+        jobId: subTask.step.jobId,
+        stepId: subTask.stepId,
+        userId: subTask.assignedUserId,
+        direction: 'OUTBOUND',
+        waMessageId: result.sid,
+        content: message,
+        status: 'sent',
+      },
+    });
+    console.log('[WhatsApp] Sub-task SID:', result.sid, 'to', to);
+    return { status: 'sent', sid: result.sid, to };
+  } catch (err) {
+    const { code, message: rawMsg } = extractTwilioError(err);
+    const reason = humanizeTwilioError(code, rawMsg);
+    console.error(`[WhatsApp] Sub-task send FAILED to ${to} (code=${code}): ${rawMsg}`);
+    await prisma.whatsAppMessage.create({
+      data: {
+        jobId: subTask.step.jobId,
+        stepId: subTask.stepId,
+        userId: subTask.assignedUserId,
+        direction: 'OUTBOUND',
+        content: `[FAILED code=${code ?? 'n/a'}] ${reason}`,
+        status: 'failed',
+      },
+    });
+    return { status: 'failed', errorCode: code, errorMessage: reason, to };
+  }
+}
+
 // Send a plain text reply back to a WhatsApp number (fire-and-forget, never throws)
 async function sendReply(to: string, message: string, options: DeliveryOptions = {}): Promise<void> {
   const target = normalizeWhatsAppTo(to);
@@ -532,6 +614,104 @@ export async function resolveStepById(
   };
 }
 
+// Admin replies to a sub-task worker via WhatsApp
+export async function sendAdminReplyToSubTask(
+  subTaskId: string,
+  adminId: string,
+  message: string,
+): Promise<{ workerName: string; jobNumber: string }> {
+  const subTask = await prisma.workflowSubTask.findUnique({
+    where: { id: subTaskId },
+    include: {
+      step: { include: { job: true } },
+      assignedUser: true,
+    },
+  });
+  if (!subTask || !subTask.assignedUser) throw new Error('Sub-task or worker not found');
+
+  const workerMsg = buildAdminReplyMessage(
+    subTask.assignedUser.language,
+    subTask.step.job.jobNumber,
+    `${subTask.step.name} › ${subTask.title}`,
+    message,
+  );
+
+  await sendReply(`whatsapp:${subTask.assignedUser.phone}`, workerMsg);
+
+  await prisma.whatsAppMessage.create({
+    data: {
+      jobId: subTask.step.jobId,
+      stepId: subTask.stepId,
+      userId: subTask.assignedUserId,
+      direction: 'OUTBOUND',
+      content: workerMsg,
+      status: 'sent',
+    },
+  });
+
+  await prisma.auditLog.create({
+    data: {
+      jobId: subTask.step.jobId,
+      stepId: subTask.stepId,
+      userId: adminId,
+      eventType: 'ADMIN_REPLY',
+      description: `Admin replied to ${subTask.assignedUser.name} on sub-task "${subTask.title}": ${message}`,
+    },
+  });
+
+  broadcastEvent('admin_replied', { jobId: subTask.step.jobId, stepId: subTask.stepId });
+
+  return { workerName: subTask.assignedUser.name, jobNumber: subTask.step.job.jobNumber };
+}
+
+// Admin resolves a sub-task issue (clears issueText, notifies worker)
+export async function resolveSubTaskById(
+  subTaskId: string,
+  adminId: string,
+): Promise<{ workerName: string; jobNumber: string; stepName: string }> {
+  const subTask = await prisma.workflowSubTask.findUnique({
+    where: { id: subTaskId },
+    include: {
+      step: { include: { job: true } },
+      assignedUser: true,
+    },
+  });
+  if (!subTask) throw new Error('Sub-task not found');
+
+  await prisma.workflowSubTask.update({
+    where: { id: subTask.id },
+    data: { issueText: null },
+  });
+
+  await prisma.auditLog.create({
+    data: {
+      jobId: subTask.step.jobId,
+      stepId: subTask.stepId,
+      userId: adminId,
+      eventType: 'ISSUE_RESOLVED',
+      description: `Admin resolved issue on sub-task "${subTask.title}"`,
+    },
+  });
+
+  broadcastEvent('issue_resolved', { jobId: subTask.step.jobId, stepId: subTask.stepId, subTaskId });
+
+  if (subTask.assignedUser) {
+    const resolveMsg = buildAdminReplyMessage(
+      subTask.assignedUser.language,
+      subTask.step.job.jobNumber,
+      `${subTask.step.name} › ${subTask.title}`,
+      '✅ Issue resolved by admin. Please continue with the task.',
+    );
+    await sendReply(`whatsapp:${subTask.assignedUser.phone}`, resolveMsg);
+  }
+
+  return {
+    workerName: subTask.assignedUser?.name ?? 'Worker',
+    jobNumber: subTask.step.job.jobNumber,
+    stepName: `${subTask.step.name} › ${subTask.title}`,
+  };
+}
+
 // Called from the UI (admin-send API) — no WhatsApp number needed
 export async function handleAdminMessageById(adminId: string, text: string): Promise<void> {
   const admin = await prisma.user.findUnique({ where: { id: adminId } });
@@ -586,6 +766,15 @@ export async function handleInboundMessage(
     return;
   }
 
+  const activeSubTask = await prisma.workflowSubTask.findFirst({
+    where: {
+      assignedUserId: user.id,
+      status: 'NOTIFIED',
+    },
+    include: { step: { include: { job: true } } },
+    orderBy: { order: 'asc' },
+  });
+
   const activeStep = await prisma.workflowStep.findFirst({
     where: {
       assignedUserId: user.id,
@@ -595,6 +784,80 @@ export async function handleInboundMessage(
     include: { job: true },
     orderBy: { stepNumber: 'asc' },
   });
+
+  // If the worker has an active sub-task → handle it (takes priority over step)
+  if (activeSubTask && text === 'DONE') {
+    await prisma.whatsAppMessage.create({
+      data: {
+        jobId: activeSubTask.step.jobId,
+        stepId: activeSubTask.stepId,
+        userId: user.id,
+        direction: 'INBOUND',
+        waMessageId,
+        content: body,
+        status: 'received',
+      },
+    });
+    const { advanceSubTask } = await import('./workflow');
+    await advanceSubTask(activeSubTask.step.jobId, activeSubTask.id, { simulateOutbound: options.simulateOutbound });
+    await sendReply(to, `✅ Sub-task *${activeSubTask.title}* marked complete. Nice work!`, { simulate: options.simulateOutbound });
+    return;
+  }
+
+  if (activeSubTask && (text.startsWith('ISSUE') || text.startsWith('HELP'))) {
+    const isIssue = text.startsWith('ISSUE');
+    const details = body.trim().replace(/^(ISSUE|HELP)\s*/i, '').trim() ||
+      (isIssue ? 'Issue reported by worker' : 'Worker requested help');
+
+    await prisma.whatsAppMessage.create({
+      data: {
+        jobId: activeSubTask.step.jobId,
+        stepId: activeSubTask.stepId,
+        userId: user.id,
+        direction: 'INBOUND',
+        waMessageId,
+        content: body,
+        status: 'received',
+      },
+    });
+
+    await prisma.workflowSubTask.update({
+      where: { id: activeSubTask.id },
+      data: { issueText: details },
+    });
+
+    await prisma.auditLog.create({
+      data: {
+        jobId: activeSubTask.step.jobId,
+        stepId: activeSubTask.stepId,
+        userId: user.id,
+        eventType: isIssue ? 'SUBTASK_ISSUE' : 'SUBTASK_HELP',
+        description: `${user.name} ${isIssue ? 'reported an issue' : 'requested help'} on sub-task "${activeSubTask.title}": ${details}`,
+      },
+    });
+
+    broadcastEvent(isIssue ? 'subtask_issue' : 'subtask_help', {
+      jobId: activeSubTask.step.jobId,
+      stepId: activeSubTask.stepId,
+      subTaskId: activeSubTask.id,
+      details,
+    });
+
+    const raisedBy = { name: user.name, phone: user.phone };
+    await sendRaisedIssueAlert(
+      activeSubTask.step.job,
+      { id: activeSubTask.stepId, name: `${activeSubTask.step.name} › ${activeSubTask.title}` },
+      raisedBy,
+      isIssue ? 'ISSUE' : 'HELP',
+      details,
+    );
+
+    const replyMsg = isIssue
+      ? `⚠️ Issue reported for *${activeSubTask.title}* on Job #${activeSubTask.step.job.jobNumber}.\n\nDetails: ${details}\n\nThe admin has been notified. Please wait for further instructions.`
+      : `🆘 Help request received for *${activeSubTask.title}* on Job #${activeSubTask.step.job.jobNumber}.\n\nThe admin will contact you shortly.`;
+    await sendReply(to, replyMsg, { simulate: options.simulateOutbound });
+    return;
+  }
 
   // Admin messages: if admin has an active assigned step AND sends a worker command,
   // process as worker. Otherwise route to admin relay handler.
@@ -757,6 +1020,84 @@ export async function sendTimerAlert(stepId: string, options: DeliveryOptions = 
   });
 
   console.log(`[Timer] Alert sent for step "${step.name}" (Job #${step.job.jobNumber})`);
+}
+
+// ─── Timer alert for a sub-task ──────────────────────────────────────────────
+export async function sendSubTaskTimerAlert(subTaskId: string, options: DeliveryOptions = {}): Promise<void> {
+  const subTask = await prisma.workflowSubTask.findUnique({
+    where: { id: subTaskId },
+    include: {
+      assignedUser: true,
+      step: { include: { job: true } },
+    },
+  });
+
+  if (!subTask || !subTask.assignedUser || !subTask.timerStartedAt || !subTask.durationMinutes) return;
+  if (subTask.timerAlertSentAt) return;
+
+  await prisma.workflowSubTask.update({
+    where: { id: subTaskId },
+    data: { timerAlertSentAt: new Date() },
+  });
+
+  const lang = (subTask.assignedUser.language as string) || 'ENGLISH';
+  const msgFn = TIMER_WORKER_MESSAGES[lang] || TIMER_WORKER_MESSAGES['ENGLISH'];
+  const label = `${subTask.step.name} › ${subTask.title}`;
+  const workerMsg = msgFn(subTask.step.job.jobNumber, label, subTask.durationMinutes);
+
+  const workerTo = normalizeWhatsAppTo(subTask.assignedUser.phone);
+  const client = getClient();
+
+  if (options.simulate || !client) {
+    console.log('[WhatsApp] SUBTASK TIMER ALERT to worker:', workerTo);
+    console.log('[WhatsApp] Message:', workerMsg);
+  } else {
+    try {
+      await client.messages.create({ from: getFrom(), to: workerTo, body: workerMsg });
+    } catch (err) {
+      const { code, message: rawMsg } = extractTwilioError(err);
+      console.error(`[WhatsApp] Sub-task timer alert failed (code=${code}): ${rawMsg}`);
+    }
+  }
+
+  await prisma.whatsAppMessage.create({
+    data: {
+      jobId: subTask.step.jobId,
+      stepId: subTask.stepId,
+      userId: subTask.assignedUserId,
+      direction: 'OUTBOUND',
+      content: workerMsg,
+      status: options.simulate ? 'simulated' : (client ? 'sent' : 'demo_sent'),
+    },
+  });
+
+  const settings = await getSystemSettings();
+  if (settings.notifyAdmin) {
+    const admin = await prisma.user.findFirst({
+      where: { role: 'ADMIN', isActive: true, phone: { not: '' } },
+    });
+    if (admin?.phone) {
+      const adminMsg =
+        `⏰ *Sub-task Timer Expired – Job #${subTask.step.job.jobNumber}*\n\n` +
+        `Step: *${subTask.step.name}*\n` +
+        `Sub-task: *${subTask.title}*\n` +
+        `Worker: ${subTask.assignedUser.name} (${subTask.assignedUser.phone})\n` +
+        `Allocated: ${subTask.durationMinutes} minutes\n\n` +
+        `The worker has been notified via WhatsApp.`;
+      await sendReply(`whatsapp:${admin.phone}`, adminMsg, options);
+    }
+  }
+
+  broadcastEvent('subtask_timer_expired', {
+    jobId: subTask.step.jobId,
+    stepId: subTask.stepId,
+    subTaskId,
+    jobNumber: subTask.step.job.jobNumber,
+    title: subTask.title,
+    workerName: subTask.assignedUser.name,
+  });
+
+  console.log(`[Timer] Sub-task alert sent: "${subTask.title}" (Job #${subTask.step.job.jobNumber})`);
 }
 
 // ─── Diagnostic test message ──────────────────────────────────────────────────

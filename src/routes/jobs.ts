@@ -3,9 +3,19 @@ import { z } from 'zod';
 import prisma from '../lib/prisma';
 import { startWorkflow, advanceWorkflow } from '../services/workflow';
 import { broadcastEvent } from '../lib/websocket';
-import { sendRaisedIssueAlert } from '../services/whatsapp';
+import { sendRaisedIssueAlert, sendSubTaskTimerAlert } from '../services/whatsapp';
+import { advanceSubTask } from '../services/workflow';
 
 const router = Router();
+
+const SubTaskSchema = z.object({
+  title: z.string().min(1),
+  description: z.string().optional(),
+  assignedUserId: z.string().uuid().optional().or(z.literal('')).transform(v => v || undefined),
+  dueAt: z.string().optional(),
+  isCompleted: z.boolean().optional(),
+  order: z.number().int().optional(),
+});
 
 const StepSchema = z.object({
   stepNumber: z.number().int().positive(),
@@ -13,6 +23,7 @@ const StepSchema = z.object({
   description: z.string().optional(),
   assignedUserId: z.string().uuid().optional(),
   dueAt: z.string().optional(),
+  subTasks: z.array(SubTaskSchema).optional(),
 });
 
 const CreateJobSchema = z.object({
@@ -23,6 +34,7 @@ const CreateJobSchema = z.object({
   measurements: z.string().optional(),
   material: z.string().optional(),
   color: z.string().optional(),
+  startDate: z.string().optional(),
   deadline: z.string(),
   priority: z.enum(['LOW', 'NORMAL', 'HIGH', 'URGENT']).optional(),
   notes: z.string().optional(),
@@ -54,7 +66,13 @@ router.get('/', async (req: Request, res: Response) => {
     orderBy: { createdAt: 'desc' },
     include: {
       workflowSteps: {
-        include: { assignedUser: { select: { id: true, name: true, role: true, phone: true } } },
+        include: {
+          assignedUser: { select: { id: true, name: true, role: true, phone: true } },
+          subTasks: {
+            include: { assignedUser: { select: { id: true, name: true, role: true } } },
+            orderBy: { order: 'asc' },
+          },
+        },
         orderBy: { stepNumber: 'asc' },
       },
       _count: { select: { photos: true, messages: true } },
@@ -73,6 +91,10 @@ router.get('/:id', async (req: Request, res: Response) => {
       workflowSteps: {
         include: {
           assignedUser: true,
+          subTasks: {
+            include: { assignedUser: { select: { id: true, name: true, role: true } } },
+            orderBy: { order: 'asc' },
+          },
           photos: { take: 5 },
           messages: { orderBy: { sentAt: 'desc' }, take: 5 },
         },
@@ -115,6 +137,7 @@ router.post('/', async (req: Request, res: Response) => {
     data: {
       ...jobData,
       jobNumber,
+      startDate: jobData.startDate ? new Date(jobData.startDate) : undefined,
       deadline: new Date(jobData.deadline),
       totalSteps: steps?.length || 0,
       workflowSteps: steps
@@ -125,12 +148,26 @@ router.post('/', async (req: Request, res: Response) => {
               description: s.description,
               assignedUserId: s.assignedUserId,
               dueAt: s.dueAt ? new Date(s.dueAt) : undefined,
+              subTasks: s.subTasks?.length
+                ? {
+                    create: s.subTasks.map((st, i) => ({
+                      title: st.title,
+                      description: st.description,
+                      assignedUserId: st.assignedUserId || undefined,
+                      dueAt: st.dueAt ? new Date(st.dueAt) : undefined,
+                      order: st.order ?? i,
+                    })),
+                  }
+                : undefined,
             })),
           }
         : undefined,
     },
     include: {
-      workflowSteps: { include: { assignedUser: true }, orderBy: { stepNumber: 'asc' } },
+      workflowSteps: {
+        include: { assignedUser: true, subTasks: { include: { assignedUser: { select: { id: true, name: true, role: true } } }, orderBy: { order: 'asc' } } },
+        orderBy: { stepNumber: 'asc' },
+      },
     },
   });
 
@@ -155,7 +192,10 @@ router.post('/', async (req: Request, res: Response) => {
   const responseJob = await prisma.job.findUnique({
     where: { id: job.id },
     include: {
-      workflowSteps: { include: { assignedUser: true }, orderBy: { stepNumber: 'asc' } },
+      workflowSteps: {
+        include: { assignedUser: true, subTasks: { include: { assignedUser: { select: { id: true, name: true, role: true } } }, orderBy: { order: 'asc' } } },
+        orderBy: { stepNumber: 'asc' },
+      },
     },
   });
 
@@ -263,9 +303,16 @@ router.post('/:id/steps', async (req: Request, res: Response) => {
     res.status(400).json({ success: false, errors: parsed.error.errors });
     return;
   }
+  const { subTasks, ...stepData } = parsed.data;
   const step = await prisma.workflowStep.create({
-    data: { ...parsed.data, jobId: String(req.params.id) },
-    include: { assignedUser: true },
+    data: {
+      ...stepData,
+      jobId: String(req.params.id),
+      subTasks: subTasks?.length
+        ? { create: subTasks.map((st, i) => ({ title: st.title, description: st.description, assignedUserId: st.assignedUserId || undefined, dueAt: st.dueAt ? new Date(st.dueAt) : undefined, order: st.order ?? i })) }
+        : undefined,
+    },
+    include: { assignedUser: true, subTasks: { include: { assignedUser: { select: { id: true, name: true, role: true } } }, orderBy: { order: 'asc' } } },
   });
   await prisma.job.update({
     where: { id: String(req.params.id) },
@@ -354,21 +401,185 @@ router.post('/:id/steps/:stepId/raise', async (req: Request, res: Response) => {
   res.json({ success: true, data: step });
 });
 
-// GET /api/jobs/timers/active  – list all steps with active timers
-router.get('/timers/active', async (_req: Request, res: Response) => {
-  const steps = await prisma.workflowStep.findMany({
-    where: {
-      timerStartedAt: { not: null },
-      durationMinutes: { not: null },
-      status: { in: ['IN_PROGRESS', 'NOTIFIED', 'WAITING'] },
-    },
-    include: {
-      assignedUser: { select: { id: true, name: true, phone: true, role: true } },
-      job: { select: { id: true, jobNumber: true, title: true, clientName: true } },
-    },
-    orderBy: { timerStartedAt: 'asc' },
+// ─── Sub-task routes ─────────────────────────────────────────────────────────
+
+// POST /api/jobs/:id/steps/:stepId/subtasks  – add a sub-task
+router.post('/:id/steps/:stepId/subtasks', async (req: Request, res: Response) => {
+  const parsed = SubTaskSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ success: false, errors: parsed.error.errors });
+    return;
+  }
+  const stepId = String(req.params.stepId);
+  // get current max order
+  const max = await prisma.workflowSubTask.aggregate({ where: { stepId }, _max: { order: true } });
+  const order = parsed.data.order ?? ((max._max.order ?? -1) + 1);
+  const subTask = await prisma.workflowSubTask.create({
+    data: { ...parsed.data, stepId, order },
   });
-  res.json({ success: true, data: steps });
+  res.status(201).json({ success: true, data: subTask });
+});
+
+// PATCH /api/jobs/:id/steps/:stepId/subtasks/:subTaskId  – update a sub-task
+router.patch('/:id/steps/:stepId/subtasks/:subTaskId', async (req: Request, res: Response) => {
+  const parsed = SubTaskSchema.partial().safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ success: false, errors: parsed.error.errors });
+    return;
+  }
+  const subTask = await prisma.workflowSubTask.update({
+    where: { id: String(req.params.subTaskId) },
+    data: parsed.data,
+  });
+  res.json({ success: true, data: subTask });
+});
+
+// DELETE /api/jobs/:id/steps/:stepId/subtasks/:subTaskId  – delete a sub-task
+router.delete('/:id/steps/:stepId/subtasks/:subTaskId', async (req: Request, res: Response) => {
+  await prisma.workflowSubTask.delete({ where: { id: String(req.params.subTaskId) } });
+  res.json({ success: true, message: 'Sub-task deleted' });
+});
+
+// ─── Sub-task action routes ──────────────────────────────────────────────────
+
+const subTaskInclude = {
+  include: {
+    assignedUser: { select: { id: true, name: true, role: true, phone: true, language: true } },
+    step: { include: { job: true } },
+  },
+};
+
+// POST /api/jobs/:id/steps/:stepId/subtasks/:subTaskId/timer/start
+router.post('/:id/steps/:stepId/subtasks/:subTaskId/timer/start', async (req: Request, res: Response) => {
+  const schema = z.object({ durationMinutes: z.number().int().positive() });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) { res.status(400).json({ success: false, errors: parsed.error.errors }); return; }
+  const subTask = await prisma.workflowSubTask.update({
+    where: { id: String(req.params.subTaskId) },
+    data: {
+      durationMinutes: parsed.data.durationMinutes,
+      timerStartedAt: new Date(),
+      timerAlertSentAt: null,
+    },
+    ...subTaskInclude,
+  });
+  res.json({ success: true, data: subTask });
+});
+
+// POST /api/jobs/:id/steps/:stepId/subtasks/:subTaskId/timer/reset
+router.post('/:id/steps/:stepId/subtasks/:subTaskId/timer/reset', async (req: Request, res: Response) => {
+  const subTask = await prisma.workflowSubTask.update({
+    where: { id: String(req.params.subTaskId) },
+    data: { durationMinutes: null, timerStartedAt: null, timerAlertSentAt: null },
+    ...subTaskInclude,
+  });
+  res.json({ success: true, data: subTask });
+});
+
+// POST /api/jobs/:id/steps/:stepId/subtasks/:subTaskId/raise  – raise issue on sub-task
+router.post('/:id/steps/:stepId/subtasks/:subTaskId/raise', async (req: Request, res: Response) => {
+  const parsed = RaiseSchema.safeParse(req.body);
+  if (!parsed.success) { res.status(400).json({ success: false, errors: parsed.error.errors }); return; }
+  const { type, details, adminId } = parsed.data;
+  const subTaskId = String(req.params.subTaskId);
+  const jobId = String(req.params.id);
+  const stepId = String(req.params.stepId);
+  const issueText = details?.trim() || (type === 'ISSUE' ? 'Issue raised from dashboard' : 'Help requested from dashboard');
+
+  const subTask = await prisma.workflowSubTask.update({
+    where: { id: subTaskId },
+    data: { issueText },
+    include: {
+      assignedUser: { select: { id: true, name: true, phone: true, language: true, role: true } },
+      step: { include: { job: true } },
+    },
+  });
+
+  await prisma.auditLog.create({
+    data: {
+      jobId,
+      stepId,
+      userId: adminId ?? null,
+      eventType: type === 'ISSUE' ? 'SUBTASK_ISSUE' : 'SUBTASK_HELP',
+      description: `${type === 'ISSUE' ? 'Issue' : 'Help'} raised on sub-task "${subTask.title}": ${issueText}`,
+    },
+  });
+
+  broadcastEvent(type === 'ISSUE' ? 'subtask_issue' : 'subtask_help', { jobId, stepId, subTaskId, details: issueText });
+
+  const raisedBy = subTask.assignedUser
+    ? { name: subTask.assignedUser.name, phone: subTask.assignedUser.phone }
+    : null;
+  await sendRaisedIssueAlert(subTask.step.job, { id: stepId, name: `${subTask.step.name} › ${subTask.title}` }, raisedBy, type, issueText);
+
+  res.json({ success: true, data: subTask });
+});
+
+// POST /api/jobs/:id/steps/:stepId/subtasks/:subTaskId/complete  – admin marks sub-task done
+router.post('/:id/steps/:stepId/subtasks/:subTaskId/complete', async (req: Request, res: Response) => {
+  const jobId = String(req.params.id);
+  const subTaskId = String(req.params.subTaskId);
+  await advanceSubTask(jobId, subTaskId);
+  res.json({ success: true });
+});
+
+// GET /api/jobs/timers/active  – list all steps + sub-tasks with active timers
+router.get('/timers/active', async (_req: Request, res: Response) => {
+  const [steps, subTasks] = await Promise.all([
+    prisma.workflowStep.findMany({
+      where: {
+        timerStartedAt: { not: null },
+        durationMinutes: { not: null },
+        status: { in: ['IN_PROGRESS', 'NOTIFIED', 'WAITING'] },
+      },
+      include: {
+        assignedUser: { select: { id: true, name: true, phone: true, role: true } },
+        job: { select: { id: true, jobNumber: true, title: true, clientName: true } },
+      },
+      orderBy: { timerStartedAt: 'asc' },
+    }),
+    prisma.workflowSubTask.findMany({
+      where: {
+        timerStartedAt: { not: null },
+        durationMinutes: { not: null },
+        status: { in: ['WAITING', 'NOTIFIED'] },
+      },
+      include: {
+        assignedUser: { select: { id: true, name: true, phone: true, role: true } },
+        step: {
+          select: {
+            id: true,
+            stepNumber: true,
+            name: true,
+            job: { select: { id: true, jobNumber: true, title: true, clientName: true } },
+          },
+        },
+      },
+      orderBy: { timerStartedAt: 'asc' },
+    }),
+  ]);
+
+  // Normalize sub-tasks to same shape as steps so frontend can render them uniformly
+  const normalizedSubTasks = subTasks.map(st => ({
+    id: st.id,
+    name: st.title,
+    stepNumber: null as number | null,
+    stepId: st.stepId,
+    status: st.status,
+    timerStartedAt: st.timerStartedAt,
+    durationMinutes: st.durationMinutes,
+    assignedUser: st.assignedUser,
+    job: st.step.job,
+    parentStep: { id: st.step.id, stepNumber: st.step.stepNumber, name: st.step.name },
+    isSubTask: true as const,
+  }));
+
+  const all = [
+    ...steps.map(s => ({ ...s, isSubTask: false as const, parentStep: null })),
+    ...normalizedSubTasks,
+  ].sort((a, b) => new Date(a.timerStartedAt!).getTime() - new Date(b.timerStartedAt!).getTime());
+
+  res.json({ success: true, data: all });
 });
 
 export default router;

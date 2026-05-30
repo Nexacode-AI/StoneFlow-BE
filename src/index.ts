@@ -7,7 +7,8 @@ import morgan from 'morgan';
 import { initWebSocket } from './lib/websocket';
 import { errorHandler, notFound } from './middleware/errorHandler';
 import prisma from './lib/prisma';
-import { sendTimerAlert } from './services/whatsapp';
+import { sendTimerAlert, sendSubTaskTimerAlert } from './services/whatsapp';
+import { startWorkflow } from './services/workflow';
 
 import dashboardRouter from './routes/dashboard';
 import usersRouter from './routes/users';
@@ -81,6 +82,8 @@ initWebSocket(server);
 async function checkExpiredTimers(): Promise<void> {
   try {
     const now = new Date();
+
+    // Check step timers
     const expiredSteps = await prisma.workflowStep.findMany({
       where: {
         timerStartedAt: { not: null },
@@ -98,15 +101,101 @@ async function checkExpiredTimers(): Promise<void> {
         await sendTimerAlert(step.id);
       }
     }
+
+    // Check sub-task timers
+    const expiredSubTasks = await prisma.workflowSubTask.findMany({
+      where: {
+        timerStartedAt: { not: null },
+        durationMinutes: { not: null },
+        timerAlertSentAt: null,
+        status: { in: ['WAITING', 'NOTIFIED'] },
+      },
+      select: { id: true, timerStartedAt: true, durationMinutes: true },
+    });
+
+    for (const st of expiredSubTasks) {
+      if (!st.timerStartedAt || !st.durationMinutes) continue;
+      const expiresAt = new Date(st.timerStartedAt.getTime() + st.durationMinutes * 60 * 1000);
+      if (now >= expiresAt) {
+        await sendSubTaskTimerAlert(st.id);
+      }
+    }
   } catch (err) {
     console.error('[Timer Checker] Error:', err);
   }
 }
 
-const TIMER_CHECK_INTERVAL_MS = 60_000; // every 1 minute
+// ─── Background: Auto-start Workflow by Start Date ───────────────────────────
+// Runs every 5 minutes. Finds jobs whose startDate is today and workflow not started.
+// If autoStart is ON  → starts the workflow automatically.
+// If autoStart is OFF → sends an alert to the Alerts panel so admin is reminded to start manually.
+async function checkAutoStartJobs(): Promise<void> {
+  try {
+    const settings = await prisma.systemSettings.upsert({
+      where: { id: 'singleton' },
+      create: { id: 'singleton' },
+      update: {},
+    });
+
+    const todayStart = new Date();
+    todayStart.setHours(0, 0, 0, 0);
+    const todayEnd = new Date();
+    todayEnd.setHours(23, 59, 59, 999);
+
+    const jobs = await prisma.job.findMany({
+      where: {
+        startDate: { gte: todayStart, lte: todayEnd },
+        status: 'PENDING',
+      },
+      include: { workflowSteps: { orderBy: { stepNumber: 'asc' } } },
+    });
+
+    for (const job of jobs) {
+      if (job.workflowSteps.length === 0) continue;
+
+      if (settings.autoStartOnDate) {
+        console.log(`[Auto-start] Starting workflow for job ${job.jobNumber}`);
+        await startWorkflow(job.id);
+        await prisma.auditLog.create({
+          data: {
+            jobId: job.id,
+            eventType: 'WORKFLOW_AUTO_STARTED',
+            description: `Workflow auto-started on scheduled start date for job #${job.jobNumber}`,
+          },
+        });
+      } else {
+        // Check we haven't already sent this reminder today
+        const alreadyAlerted = await prisma.auditLog.findFirst({
+          where: {
+            jobId: job.id,
+            eventType: 'AUTO_START_REMINDER',
+            createdAt: { gte: todayStart },
+          },
+        });
+        if (!alreadyAlerted) {
+          console.log(`[Auto-start] Sending reminder for job ${job.jobNumber} (auto-start disabled)`);
+          await prisma.auditLog.create({
+            data: {
+              jobId: job.id,
+              eventType: 'AUTO_START_REMINDER',
+              description: `Job #${job.jobNumber} was scheduled to start today but auto-start is disabled. Please start the workflow manually.`,
+            },
+          });
+        }
+      }
+    }
+  } catch (err) {
+    console.error('[Auto-start Checker] Error:', err);
+  }
+}
+
+const AUTO_START_CHECK_INTERVAL_MS = 5 * 60 * 1000; // every 5 minutes
+setInterval(checkAutoStartJobs, AUTO_START_CHECK_INTERVAL_MS);
+checkAutoStartJobs(); // run once at startup
+
+const TIMER_CHECK_INTERVAL_MS = 60 * 1000; // every 60 seconds
 setInterval(checkExpiredTimers, TIMER_CHECK_INTERVAL_MS);
-// Run once at startup to catch any timers that expired while server was down
-checkExpiredTimers();
+checkExpiredTimers(); // run once at startup
 
 server.listen(PORT, () => {
   console.log(`\n🏗️  Stone Co Backend running on http://localhost:${PORT}`);
