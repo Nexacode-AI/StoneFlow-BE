@@ -1,6 +1,6 @@
 import 'dotenv/config';
 import http from 'http';
-import express, { Request, Response } from 'express';
+import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
 import morgan from 'morgan';
@@ -47,8 +47,7 @@ app.options('*', cors(corsOptions)); // handle preflight for all routes
 app.use(cors(corsOptions));
 app.use(morgan('dev'));
 
-// WhatsApp webhook from Twilio sends application/x-www-form-urlencoded
-app.use('/api/webhooks', express.urlencoded({ extended: false }));
+// Meta WhatsApp Cloud API sends JSON — handled by the global express.json middleware below
 app.use(express.json({ limit: '10mb' }));
 
 // ─── Routes ──────────────────────────────────────────────────────────────────

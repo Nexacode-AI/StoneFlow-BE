@@ -54,9 +54,9 @@ jobs:
             --set-env-vars "NODE_ENV=production" \
             --set-secrets "DATABASE_URL=database-url:latest" \
             --set-secrets "JWT_SECRET=jwt-secret:latest" \
-            --set-secrets "TWILIO_ACCOUNT_SID=twilio-account-sid:latest" \
-            --set-secrets "TWILIO_AUTH_TOKEN=twilio-auth-token:latest" \
-            --set-secrets "TWILIO_WHATSAPP_FROM=twilio-whatsapp-from:latest" \
+            --set-secrets "META_ACCESS_TOKEN=meta-access-token:latest" \
+            --set-secrets "META_PHONE_NUMBER_ID=meta-phone-number-id:latest" \
+            --set-secrets "META_WABA_ID=meta-waba-id:latest" \
             --set-secrets "WHATSAPP_VERIFY_TOKEN=whatsapp-verify-token:latest" \
             --set-secrets "ADMIN_USERNAME=admin-username:latest" \
             --set-secrets "ADMIN_PASSWORD=admin-password:latest" \
