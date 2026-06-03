@@ -49,6 +49,14 @@ enum Priority {
   URGENT
 }
 
+enum ProjectStatus {
+  PLANNING
+  ACTIVE
+  ON_HOLD
+  COMPLETED
+  CANCELLED
+}
+
 enum StepStatus {
   WAITING
   NOTIFIED
@@ -71,6 +79,36 @@ enum SubTaskStatus {
 }
 
 // ─── Models ───────────────────────────────────────────────────────────────────
+
+model Project {
+  id            String        @id @default(uuid())
+  projectNumber String        @unique
+  name          String
+  clientName    String
+  clientPhone   String?
+  description   String?
+  location      String?
+  status        ProjectStatus @default(PLANNING)
+  startDate     DateTime?
+  deadline      DateTime?
+  notes         String?
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+
+  jobs   Job[]
+  levels ProjectLevel[]
+}
+
+model ProjectLevel {
+  id        String   @id @default(uuid())
+  projectId String
+  name      String
+  order     Int      @default(0)
+  createdAt DateTime @default(now())
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  jobs    Job[]
+}
 
 model User {
   id        String   @id @default(uuid())
@@ -111,6 +149,18 @@ model Job {
   createdAt    DateTime  @default(now())
   updatedAt    DateTime  @updatedAt
   completedAt  DateTime?
+
+  // Project / hierarchy fields
+  projectId      String?
+  parentJobId    String?
+  levelName      String?
+  unitNumber     String?
+  projectLevelId String?
+
+  project      Project?      @relation(fields: [projectId], references: [id], onDelete: SetNull)
+  projectLevel ProjectLevel? @relation(fields: [projectLevelId], references: [id], onDelete: Cascade)
+  parent       Job?          @relation("SubJobs", fields: [parentJobId], references: [id], onDelete: Cascade)
+  subJobs      Job[]         @relation("SubJobs")
 
   workflowSteps WorkflowStep[]
   photos        JobPhoto[]

@@ -20,6 +20,7 @@ import analyticsRouter from './routes/analytics';
 import settingsRouter from './routes/settings';
 import authRouter from './routes/auth';
 import financeRouter from './routes/finance';
+import projectsRouter from './routes/projects';
 
 const app = express();
 const PORT = process.env.PORT || 4000;
@@ -62,6 +63,7 @@ app.use('/api/webhooks', webhooksRouter);
 app.use('/api/dashboard',          dashboardRouter);
 app.use('/api/users',              usersRouter);
 app.use('/api/jobs',               jobsRouter);
+app.use('/api/projects',           projectsRouter);
 app.use('/api/workflow-templates', workflowsRouter);
 app.use('/api/messages',           messagesRouter);
 app.use('/api/analytics',          analyticsRouter);

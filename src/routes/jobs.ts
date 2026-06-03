@@ -2,6 +2,7 @@ import { Router, Request, Response } from 'express';
 import { z } from 'zod';
 import prisma from '../lib/prisma';
 import { startWorkflow, advanceWorkflow } from '../services/workflow';
+import { syncProjectStatus } from './projects';
 import { broadcastEvent } from '../lib/websocket';
 import { sendRaisedIssueAlert, sendSubTaskTimerAlert } from '../services/whatsapp';
 import { advanceSubTask } from '../services/workflow';
@@ -38,6 +39,12 @@ const CreateJobSchema = z.object({
   deadline: z.string(),
   priority: z.enum(['LOW', 'NORMAL', 'HIGH', 'URGENT']).optional(),
   notes: z.string().optional(),
+  // Project hierarchy
+  projectId: z.string().uuid().optional(),
+  parentJobId: z.string().uuid().optional(),
+  levelName: z.string().optional(),
+  unitNumber: z.string().optional(),
+  projectLevelId: z.string().uuid().optional(),
   steps: z.array(StepSchema).optional(),
 });
 
@@ -75,6 +82,7 @@ router.get('/', async (req: Request, res: Response) => {
         },
         orderBy: { stepNumber: 'asc' },
       },
+      project: { select: { id: true, projectNumber: true, name: true } },
       _count: { select: { photos: true, messages: true } },
     },
   });
@@ -106,6 +114,7 @@ router.get('/:id', async (req: Request, res: Response) => {
         take: 20,
       },
       photos: { orderBy: { uploadedAt: 'desc' }, take: 20 },
+      project: { select: { id: true, projectNumber: true, name: true } },
       _count: { select: { photos: true, messages: true } },
     },
   });
@@ -178,6 +187,14 @@ router.post('/', async (req: Request, res: Response) => {
       description: `Job #${job.jobNumber} created for ${job.clientName}`,
     },
   });
+
+  // When a unit is added to a project, sync status (→ ACTIVE unless CANCELLED)
+  if (job.projectId) {
+    await prisma.project.updateMany({
+      where: { id: job.projectId, status: { not: 'CANCELLED' } },
+      data: { status: 'ACTIVE' },
+    });
+  }
 
   const settings = await prisma.systemSettings.upsert({
     where: { id: 'singleton' },

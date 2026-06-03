@@ -558,7 +558,7 @@ export async function sendAdminReplyToStep(
     data: {
       jobId: step.jobId,
       stepId: step.id,
-      userId: adminId,
+      userId: await safeUserId(adminId),
       eventType: 'ADMIN_REPLY',
       description: `Admin replied to ${step.assignedUser.name} on "${step.name}": ${message}`,
     },
@@ -567,6 +567,13 @@ export async function sendAdminReplyToStep(
   broadcastEvent('admin_replied', { jobId: step.jobId, stepId: step.id });
 
   return { workerName: step.assignedUser.name, jobNumber: step.job.jobNumber };
+}
+
+// Returns the adminId only if it corresponds to a real User row, otherwise null.
+async function safeUserId(adminId: string | undefined | null): Promise<string | null> {
+  if (!adminId) return null;
+  const exists = await prisma.user.findUnique({ where: { id: adminId }, select: { id: true } });
+  return exists ? adminId : null;
 }
 
 // Resolve a step issue directly by stepId (used from UI dashboard)
@@ -589,7 +596,7 @@ export async function resolveStepById(
     data: {
       jobId: step.jobId,
       stepId: step.id,
-      userId: adminId,
+      userId: await safeUserId(adminId),
       eventType: 'ISSUE_RESOLVED',
       description: `Admin resolved issue on "${step.name}"`,
     },
@@ -653,7 +660,7 @@ export async function sendAdminReplyToSubTask(
     data: {
       jobId: subTask.step.jobId,
       stepId: subTask.stepId,
-      userId: adminId,
+      userId: await safeUserId(adminId),
       eventType: 'ADMIN_REPLY',
       description: `Admin replied to ${subTask.assignedUser.name} on sub-task "${subTask.title}": ${message}`,
     },
@@ -687,7 +694,7 @@ export async function resolveSubTaskById(
     data: {
       jobId: subTask.step.jobId,
       stepId: subTask.stepId,
-      userId: adminId,
+      userId: await safeUserId(adminId),
       eventType: 'ISSUE_RESOLVED',
       description: `Admin resolved issue on sub-task "${subTask.title}"`,
     },

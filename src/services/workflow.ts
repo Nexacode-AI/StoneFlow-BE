@@ -61,10 +61,19 @@ export async function advanceWorkflow(
 ): Promise<DeliveryResult | null> {
   const completedStep = await prisma.workflowStep.findUnique({
     where: { id: completedStepId },
-    include: { job: true },
+    include: {
+      job: true,
+      subTasks: { select: { id: true, status: true } },
+    },
   });
 
   if (!completedStep) return null;
+
+  // Block completion if any sub-task is not yet done
+  const incomplete = completedStep.subTasks.filter(st => st.status !== 'COMPLETED');
+  if (incomplete.length > 0) {
+    throw new Error(`Cannot complete step — ${incomplete.length} sub-task${incomplete.length !== 1 ? 's' : ''} still pending.`);
+  }
 
   await prisma.workflowStep.update({
     where: { id: completedStepId },
@@ -109,6 +118,14 @@ export async function advanceWorkflow(
       },
     });
     broadcastEvent('job_completed', { jobId });
+
+    // Sync project status — completes the project if all units are done
+    if (completedStep.job.projectId) {
+      const { syncProjectStatus } = await import('../routes/projects');
+      await syncProjectStatus(completedStep.job.projectId);
+      broadcastEvent('project_status_changed', { projectId: completedStep.job.projectId });
+    }
+
     return null;
   }
 
