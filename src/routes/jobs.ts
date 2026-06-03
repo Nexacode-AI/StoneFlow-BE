@@ -6,6 +6,7 @@ import { syncProjectStatus } from './projects';
 import { broadcastEvent } from '../lib/websocket';
 import { sendRaisedIssueAlert, sendSubTaskTimerAlert } from '../services/whatsapp';
 import { advanceSubTask } from '../services/workflow';
+import { withCache, invalidate, invalidatePattern } from '../lib/cache';
 
 const router = Router();
 
@@ -57,73 +58,79 @@ function generateJobNumber(): string {
 // GET /api/jobs
 router.get('/', async (req: Request, res: Response) => {
   const { status, priority, search } = req.query as Record<string, string>;
+  const cacheKey = `jobs:list:${status || ''}|${priority || ''}|${search || ''}`;
 
-  const jobs = await prisma.job.findMany({
-    where: {
-      ...(status && { status: status as never }),
-      ...(priority && { priority: priority as never }),
-      ...(search && {
-        OR: [
-          { title: { contains: search, mode: 'insensitive' } },
-          { clientName: { contains: search, mode: 'insensitive' } },
-          { jobNumber: { contains: search, mode: 'insensitive' } },
-        ],
-      }),
-    },
-    orderBy: { createdAt: 'desc' },
-    include: {
-      workflowSteps: {
-        include: {
-          assignedUser: { select: { id: true, name: true, role: true, phone: true } },
-          subTasks: {
-            include: { assignedUser: { select: { id: true, name: true, role: true } } },
-            orderBy: { order: 'asc' },
-          },
-        },
-        orderBy: { stepNumber: 'asc' },
+  const data = await withCache(cacheKey, 20, async () => {
+    return prisma.job.findMany({
+      where: {
+        ...(status && { status: status as never }),
+        ...(priority && { priority: priority as never }),
+        ...(search && {
+          OR: [
+            { title: { contains: search, mode: 'insensitive' } },
+            { clientName: { contains: search, mode: 'insensitive' } },
+            { jobNumber: { contains: search, mode: 'insensitive' } },
+          ],
+        }),
       },
-      project: { select: { id: true, projectNumber: true, name: true } },
-      _count: { select: { photos: true, messages: true } },
-    },
+      orderBy: { createdAt: 'desc' },
+      include: {
+        workflowSteps: {
+          include: {
+            assignedUser: { select: { id: true, name: true, role: true, phone: true } },
+            subTasks: {
+              include: { assignedUser: { select: { id: true, name: true, role: true } } },
+              orderBy: { order: 'asc' },
+            },
+          },
+          orderBy: { stepNumber: 'asc' },
+        },
+        project: { select: { id: true, projectNumber: true, name: true } },
+        _count: { select: { photos: true, messages: true } },
+      },
+    });
   });
 
-  res.json({ success: true, data: jobs });
+  res.json({ success: true, data });
 });
 
 // GET /api/jobs/:id
 router.get('/:id', async (req: Request, res: Response) => {
   const id = String(req.params.id);
-  const job = await prisma.job.findUnique({
-    where: { id },
-    include: {
-      workflowSteps: {
-        include: {
-          assignedUser: true,
-          subTasks: {
-            include: { assignedUser: { select: { id: true, name: true, role: true } } },
-            orderBy: { order: 'asc' },
+
+  const data = await withCache(`jobs:${id}`, 30, async () => {
+    return prisma.job.findUnique({
+      where: { id },
+      include: {
+        workflowSteps: {
+          include: {
+            assignedUser: true,
+            subTasks: {
+              include: { assignedUser: { select: { id: true, name: true, role: true } } },
+              orderBy: { order: 'asc' },
+            },
+            photos: { take: 5 },
+            messages: { orderBy: { sentAt: 'desc' }, take: 5 },
           },
-          photos: { take: 5 },
-          messages: { orderBy: { sentAt: 'desc' }, take: 5 },
+          orderBy: { stepNumber: 'asc' },
         },
-        orderBy: { stepNumber: 'asc' },
+        auditLogs: {
+          include: { user: { select: { id: true, name: true } } },
+          orderBy: { createdAt: 'desc' },
+          take: 20,
+        },
+        photos: { orderBy: { uploadedAt: 'desc' }, take: 20 },
+        project: { select: { id: true, projectNumber: true, name: true } },
+        _count: { select: { photos: true, messages: true } },
       },
-      auditLogs: {
-        include: { user: { select: { id: true, name: true } } },
-        orderBy: { createdAt: 'desc' },
-        take: 20,
-      },
-      photos: { orderBy: { uploadedAt: 'desc' }, take: 20 },
-      project: { select: { id: true, projectNumber: true, name: true } },
-      _count: { select: { photos: true, messages: true } },
-    },
+    });
   });
 
-  if (!job) {
+  if (!data) {
     res.status(404).json({ success: false, message: 'Job not found' });
     return;
   }
-  res.json({ success: true, data: job });
+  res.json({ success: true, data });
 });
 
 // POST /api/jobs
@@ -216,6 +223,9 @@ router.post('/', async (req: Request, res: Response) => {
     },
   });
 
+  await invalidatePattern('jobs:list');
+  await invalidate('dashboard');
+
   res.status(201).json({ success: true, data: responseJob ?? job });
 });
 
@@ -226,20 +236,26 @@ router.put('/:id', async (req: Request, res: Response) => {
     res.status(400).json({ success: false, errors: parsed.error.errors });
     return;
   }
+  const jobId = String(req.params.id);
   const { steps, ...jobData } = parsed.data;
   const job = await prisma.job.update({
-    where: { id: String(req.params.id) },
+    where: { id: jobId },
     data: {
       ...jobData,
       ...(jobData.deadline && { deadline: new Date(jobData.deadline) }),
     },
   });
+  await invalidatePattern('jobs:list');
+  await invalidate(`jobs:${jobId}`, 'dashboard');
   res.json({ success: true, data: job });
 });
 
 // DELETE /api/jobs/:id
 router.delete('/:id', async (req: Request, res: Response) => {
-  await prisma.job.delete({ where: { id: String(req.params.id) } });
+  const jobId = String(req.params.id);
+  await prisma.job.delete({ where: { id: jobId } });
+  await invalidatePattern('jobs:list');
+  await invalidate(`jobs:${jobId}`, 'dashboard');
   res.json({ success: true, message: 'Job deleted' });
 });
 
@@ -254,21 +270,27 @@ router.patch('/:id/status', async (req: Request, res: Response) => {
     res.status(400).json({ success: false, errors: parsed.error.errors });
     return;
   }
+  const jobId = String(req.params.id);
   const job = await prisma.job.update({
-    where: { id: String(req.params.id) },
+    where: { id: jobId },
     data: {
       status: parsed.data.status,
       ...(parsed.data.status === 'COMPLETED' && { completedAt: new Date() }),
     },
   });
+  await invalidatePattern('jobs:list');
+  await invalidate(`jobs:${jobId}`, 'dashboard');
   res.json({ success: true, data: job });
 });
 
 // POST /api/jobs/:id/start
 router.post('/:id/start', async (req: Request, res: Response) => {
+  const jobId = String(req.params.id);
   try {
-    const result = await startWorkflow(String(req.params.id));
+    const result = await startWorkflow(jobId);
     const notification = result.notification;
+    await invalidatePattern('jobs:list');
+    await invalidate(`jobs:${jobId}`, 'dashboard');
     if (notification && notification.status === 'failed') {
       res.status(200).json({
         success: true,
@@ -290,8 +312,11 @@ router.post('/:id/start', async (req: Request, res: Response) => {
 
 // POST /api/jobs/:id/steps/:stepId/complete
 router.post('/:id/steps/:stepId/complete', async (req: Request, res: Response) => {
+  const jobId = String(req.params.id);
   try {
-    const notification = await advanceWorkflow(String(req.params.id), String(req.params.stepId));
+    const notification = await advanceWorkflow(jobId, String(req.params.stepId));
+    await invalidatePattern('jobs:list');
+    await invalidate(`jobs:${jobId}`, 'dashboard');
     res.json({
       success: true,
       message: 'Step completed, next step notified',
@@ -305,16 +330,19 @@ router.post('/:id/steps/:stepId/complete', async (req: Request, res: Response) =
 
 // PATCH /api/jobs/:id/steps/:stepId
 router.patch('/:id/steps/:stepId', async (req: Request, res: Response) => {
+  const jobId = String(req.params.id);
   const step = await prisma.workflowStep.update({
     where: { id: String(req.params.stepId) },
     data: req.body,
     include: { assignedUser: true },
   });
+  await invalidate(`jobs:${jobId}`);
   res.json({ success: true, data: step });
 });
 
 // POST /api/jobs/:id/steps  – add a step to existing job
 router.post('/:id/steps', async (req: Request, res: Response) => {
+  const jobId = String(req.params.id);
   const parsed = StepSchema.safeParse(req.body);
   if (!parsed.success) {
     res.status(400).json({ success: false, errors: parsed.error.errors });
@@ -324,7 +352,7 @@ router.post('/:id/steps', async (req: Request, res: Response) => {
   const step = await prisma.workflowStep.create({
     data: {
       ...stepData,
-      jobId: String(req.params.id),
+      jobId,
       subTasks: subTasks?.length
         ? { create: subTasks.map((st, i) => ({ title: st.title, description: st.description, assignedUserId: st.assignedUserId || undefined, dueAt: st.dueAt ? new Date(st.dueAt) : undefined, order: st.order ?? i })) }
         : undefined,
@@ -332,9 +360,11 @@ router.post('/:id/steps', async (req: Request, res: Response) => {
     include: { assignedUser: true, subTasks: { include: { assignedUser: { select: { id: true, name: true, role: true } } }, orderBy: { order: 'asc' } } },
   });
   await prisma.job.update({
-    where: { id: String(req.params.id) },
+    where: { id: jobId },
     data: { totalSteps: { increment: 1 } },
   });
+  await invalidatePattern('jobs:list');
+  await invalidate(`jobs:${jobId}`, 'dashboard');
   res.status(201).json({ success: true, data: step });
 });
 
@@ -415,6 +445,8 @@ router.post('/:id/steps/:stepId/raise', async (req: Request, res: Response) => {
     : null;
   await sendRaisedIssueAlert(step.job, { id: stepId, name: step.name }, raisedBy, type, issueText);
 
+  await invalidate(`jobs:${jobId}`);
+
   res.json({ success: true, data: step });
 });
 
@@ -422,6 +454,7 @@ router.post('/:id/steps/:stepId/raise', async (req: Request, res: Response) => {
 
 // POST /api/jobs/:id/steps/:stepId/subtasks  – add a sub-task
 router.post('/:id/steps/:stepId/subtasks', async (req: Request, res: Response) => {
+  const jobId = String(req.params.id);
   const parsed = SubTaskSchema.safeParse(req.body);
   if (!parsed.success) {
     res.status(400).json({ success: false, errors: parsed.error.errors });
@@ -434,11 +467,13 @@ router.post('/:id/steps/:stepId/subtasks', async (req: Request, res: Response) =
   const subTask = await prisma.workflowSubTask.create({
     data: { ...parsed.data, stepId, order },
   });
+  await invalidate(`jobs:${jobId}`);
   res.status(201).json({ success: true, data: subTask });
 });
 
 // PATCH /api/jobs/:id/steps/:stepId/subtasks/:subTaskId  – update a sub-task
 router.patch('/:id/steps/:stepId/subtasks/:subTaskId', async (req: Request, res: Response) => {
+  const jobId = String(req.params.id);
   const parsed = SubTaskSchema.partial().safeParse(req.body);
   if (!parsed.success) {
     res.status(400).json({ success: false, errors: parsed.error.errors });
@@ -448,12 +483,15 @@ router.patch('/:id/steps/:stepId/subtasks/:subTaskId', async (req: Request, res:
     where: { id: String(req.params.subTaskId) },
     data: parsed.data,
   });
+  await invalidate(`jobs:${jobId}`);
   res.json({ success: true, data: subTask });
 });
 
 // DELETE /api/jobs/:id/steps/:stepId/subtasks/:subTaskId  – delete a sub-task
 router.delete('/:id/steps/:stepId/subtasks/:subTaskId', async (req: Request, res: Response) => {
+  const jobId = String(req.params.id);
   await prisma.workflowSubTask.delete({ where: { id: String(req.params.subTaskId) } });
+  await invalidate(`jobs:${jobId}`);
   res.json({ success: true, message: 'Sub-task deleted' });
 });
 
@@ -529,6 +567,8 @@ router.post('/:id/steps/:stepId/subtasks/:subTaskId/raise', async (req: Request,
     : null;
   await sendRaisedIssueAlert(subTask.step.job, { id: stepId, name: `${subTask.step.name} › ${subTask.title}` }, raisedBy, type, issueText);
 
+  await invalidate(`jobs:${jobId}`);
+
   res.json({ success: true, data: subTask });
 });
 
@@ -537,6 +577,8 @@ router.post('/:id/steps/:stepId/subtasks/:subTaskId/complete', async (req: Reque
   const jobId = String(req.params.id);
   const subTaskId = String(req.params.subTaskId);
   await advanceSubTask(jobId, subTaskId);
+  await invalidatePattern('jobs:list');
+  await invalidate(`jobs:${jobId}`, 'dashboard');
   res.json({ success: true });
 });
 

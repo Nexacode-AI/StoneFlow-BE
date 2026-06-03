@@ -2,6 +2,7 @@ import { Router, Request, Response } from 'express';
 import { z } from 'zod';
 import prisma from '../lib/prisma';
 import { startWorkflow } from '../services/workflow';
+import { withCache, invalidate, invalidatePattern } from '../lib/cache';
 
 const router = Router();
 
@@ -66,30 +67,33 @@ export async function syncProjectStatus(projectId: string): Promise<void> {
 // GET /api/projects
 router.get('/', async (req: Request, res: Response) => {
   const { status, search } = req.query as Record<string, string>;
+  const cacheKey = `projects:list:${status || ''}|${search || ''}`;
 
-  const projects = await prisma.project.findMany({
-    where: {
-      ...(status && { status: status as never }),
-      ...(search && {
-        OR: [
-          { name: { contains: search, mode: 'insensitive' } },
-          { clientName: { contains: search, mode: 'insensitive' } },
-          { projectNumber: { contains: search, mode: 'insensitive' } },
-        ],
-      }),
-    },
-    orderBy: { createdAt: 'desc' },
-    include: {
-      _count: { select: { levels: true } },
-      levels: { select: { _count: { select: { jobs: true } } } },
-    },
+  const data = await withCache(cacheKey, 30, async () => {
+    const projects = await prisma.project.findMany({
+      where: {
+        ...(status && { status: status as never }),
+        ...(search && {
+          OR: [
+            { name: { contains: search, mode: 'insensitive' } },
+            { clientName: { contains: search, mode: 'insensitive' } },
+            { projectNumber: { contains: search, mode: 'insensitive' } },
+          ],
+        }),
+      },
+      orderBy: { createdAt: 'desc' },
+      include: {
+        _count: { select: { levels: true } },
+        levels: { select: { _count: { select: { jobs: true } } } },
+      },
+    });
+
+    return projects.map(p => ({
+      ...p,
+      levelCount: p._count.levels,
+      totalUnits: p.levels.reduce((s: number, l: { _count: { jobs: number } }) => s + l._count.jobs, 0),
+    }));
   });
-
-  const data = projects.map(p => ({
-    ...p,
-    levelCount: p._count.levels,
-    totalUnits: p.levels.reduce((s: number, l: { _count: { jobs: number } }) => s + l._count.jobs, 0),
-  }));
 
   res.json({ success: true, data });
 });
@@ -98,37 +102,28 @@ router.get('/', async (req: Request, res: Response) => {
 router.get('/:id', async (req: Request, res: Response) => {
   const id = String(req.params.id);
 
-  const project = await prisma.project.findUnique({
-    where: { id },
-    include: {
-      levels: {
-        orderBy: { order: 'asc' },
-        include: {
-          jobs: {
-            orderBy: { createdAt: 'asc' },
-            include: unitJobInclude,
-          },
+  // Check existence before cache so we can 404 early
+  const exists = await prisma.project.findUnique({ where: { id }, select: { id: true } });
+  if (!exists) return res.status(404).json({ success: false, error: 'Project not found' });
+
+  // Recalculate status based on actual job completion state (may update DB)
+  await syncProjectStatus(id);
+  // Invalidate stale cache entry so the re-fetch below is stored fresh
+  await invalidate(`projects:${id}`);
+
+  const data = await withCache(`projects:${id}`, 30, async () => {
+    return prisma.project.findUnique({
+      where: { id },
+      include: {
+        levels: {
+          orderBy: { order: 'asc' },
+          include: { jobs: { orderBy: { createdAt: 'asc' }, include: unitJobInclude } },
         },
       },
-    },
+    });
   });
 
-  if (!project) return res.status(404).json({ success: false, error: 'Project not found' });
-
-  // Recalculate status based on actual job completion state
-  await syncProjectStatus(id);
-
-  // Re-fetch if status may have changed
-  const fresh = await prisma.project.findUnique({
-    where: { id },
-    include: {
-      levels: {
-        orderBy: { order: 'asc' },
-        include: { jobs: { orderBy: { createdAt: 'asc' }, include: unitJobInclude } },
-      },
-    },
-  });
-  return res.json({ success: true, data: fresh ?? project });
+  return res.json({ success: true, data });
 });
 
 // POST /api/projects
@@ -153,6 +148,8 @@ router.post('/', async (req: Request, res: Response) => {
     },
   });
 
+  await invalidatePattern('projects:list');
+
   return res.status(201).json({ success: true, data: project });
 });
 
@@ -172,12 +169,18 @@ router.put('/:id', async (req: Request, res: Response) => {
     },
   });
 
+  await invalidatePattern('projects:list');
+  await invalidate(`projects:${id}`);
+
   return res.json({ success: true, data: project });
 });
 
 // DELETE /api/projects/:id
 router.delete('/:id', async (req: Request, res: Response) => {
-  await prisma.project.delete({ where: { id: String(req.params.id) } });
+  const id = String(req.params.id);
+  await prisma.project.delete({ where: { id } });
+  await invalidatePattern('projects:list');
+  await invalidate(`projects:${id}`);
   return res.json({ success: true });
 });
 
@@ -206,11 +209,15 @@ router.post('/:id/levels', async (req: Request, res: Response) => {
     include: { jobs: { include: unitJobInclude } },
   });
 
+  await invalidatePattern('projects:list');
+  await invalidate(`projects:${projectId}`);
+
   return res.status(201).json({ success: true, data: level });
 });
 
 // PUT /api/projects/:id/levels/:levelId
 router.put('/:id/levels/:levelId', async (req: Request, res: Response) => {
+  const projectId = String(req.params.id);
   const { name, order } = req.body as { name?: string; order?: number };
   const level = await prisma.projectLevel.update({
     where: { id: String(req.params.levelId) },
@@ -220,12 +227,16 @@ router.put('/:id/levels/:levelId', async (req: Request, res: Response) => {
     },
     include: { jobs: { include: unitJobInclude } },
   });
+  await invalidate(`projects:${projectId}`);
   return res.json({ success: true, data: level });
 });
 
 // DELETE /api/projects/:id/levels/:levelId
 router.delete('/:id/levels/:levelId', async (req: Request, res: Response) => {
+  const projectId = String(req.params.id);
   await prisma.projectLevel.delete({ where: { id: String(req.params.levelId) } });
+  await invalidatePattern('projects:list');
+  await invalidate(`projects:${projectId}`);
   return res.json({ success: true });
 });
 
@@ -269,6 +280,9 @@ router.post('/:id/start', async (req: Request, res: Response) => {
 
   // Mark project as ACTIVE
   await prisma.project.update({ where: { id }, data: { status: 'ACTIVE' } });
+
+  await invalidatePattern('projects:list');
+  await invalidate(`projects:${id}`);
 
   return res.json({ success: true, data: { started, total: pendingJobs.length } });
 });
