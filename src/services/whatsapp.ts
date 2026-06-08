@@ -1,6 +1,7 @@
 import twilio from 'twilio';
 import prisma from '../lib/prisma';
 import { broadcastEvent } from '../lib/websocket';
+import { metaConfigured, sendMetaText } from './meta';
 
 const accountSid = process.env.TWILIO_ACCOUNT_SID || '';
 const authToken = process.env.TWILIO_AUTH_TOKEN || '';
@@ -28,6 +29,29 @@ function getClient() {
     twilioClient = twilio(accountSid, authToken);
   }
   return twilioClient;
+}
+
+// ─── Provider-aware delivery ──────────────────────────────────────────────────
+// Meta WhatsApp Cloud API takes priority when configured; Twilio is the fallback.
+// When neither is configured we are in DEMO mode (logged, not sent).
+function canDeliver(): boolean {
+  return metaConfigured() || !!getClient();
+}
+
+type DeliveryProvider = 'meta' | 'twilio';
+
+// Sends a plain text WhatsApp message via whichever provider is configured.
+// `to` may be "whatsapp:+60..." or "+60..."; each provider normalises as needed.
+// Returns the provider message id (wamid / Twilio SID) when available.
+async function deliver(to: string, body: string): Promise<{ id?: string; provider: DeliveryProvider }> {
+  if (metaConfigured()) {
+    const id = await sendMetaText(to, body);
+    return { id, provider: 'meta' };
+  }
+  const client = getClient();
+  if (!client) throw new Error('No WhatsApp provider configured (set META_* or TWILIO_* env vars)');
+  const result = await client.messages.create({ from: getFrom(), to: normalizeWhatsAppTo(to), body });
+  return { id: result.sid, provider: 'twilio' };
 }
 
 // Normalize "whatsapp:+..." — strip non-digits (except leading +) inside the number portion
@@ -148,10 +172,8 @@ export async function sendStepNotification(stepId: string, options: DeliveryOpti
   );
 
   const to = normalizeWhatsAppTo(step.assignedUser.phone);
-  const client = getClient();
-  const from = getFrom();
 
-  if (options.simulate || !client) {
+  if (options.simulate || !canDeliver()) {
     const mode = options.simulate ? 'SIMULATION' : 'DEMO MODE';
     console.log(`[WhatsApp] ${mode} – Would send to:`, to);
     console.log('[WhatsApp] Message:', message);
@@ -169,20 +191,20 @@ export async function sendStepNotification(stepId: string, options: DeliveryOpti
   }
 
   try {
-    const result = await client.messages.create({ from, to, body: message });
+    const result = await deliver(to, message);
     await prisma.whatsAppMessage.create({
       data: {
         jobId: step.jobId,
         stepId: step.id,
         userId: step.assignedUserId,
         direction: 'OUTBOUND',
-        waMessageId: result.sid,
+        waMessageId: result.id || undefined,
         content: message,
         status: 'sent',
       },
     });
-    console.log('[WhatsApp] Sent SID:', result.sid, 'to', to);
-    return { status: 'sent', sid: result.sid, to };
+    console.log(`[WhatsApp] Sent via ${result.provider} (${result.id}) to`, to);
+    return { status: 'sent', sid: result.id, to };
   } catch (err) {
     const { code, message: rawMsg } = extractTwilioError(err);
     const reason = humanizeTwilioError(code, rawMsg);
@@ -238,10 +260,8 @@ export async function sendSubTaskNotification(subTaskId: string, options: Delive
   );
 
   const to = normalizeWhatsAppTo(assignedUser.phone);
-  const client = getClient();
-  const from = getFrom();
 
-  if (options.simulate || !client) {
+  if (options.simulate || !canDeliver()) {
     const mode = options.simulate ? 'SIMULATION' : 'DEMO MODE';
     console.log(`[WhatsApp] ${mode} – Sub-task notify to:`, to);
     console.log('[WhatsApp] Message:', message);
@@ -259,20 +279,20 @@ export async function sendSubTaskNotification(subTaskId: string, options: Delive
   }
 
   try {
-    const result = await client.messages.create({ from, to, body: message });
+    const result = await deliver(to, message);
     await prisma.whatsAppMessage.create({
       data: {
         jobId: subTask.step.jobId,
         stepId: subTask.stepId,
         userId: subTask.assignedUserId,
         direction: 'OUTBOUND',
-        waMessageId: result.sid,
+        waMessageId: result.id || undefined,
         content: message,
         status: 'sent',
       },
     });
-    console.log('[WhatsApp] Sub-task SID:', result.sid, 'to', to);
-    return { status: 'sent', sid: result.sid, to };
+    console.log(`[WhatsApp] Sub-task sent via ${result.provider} (${result.id}) to`, to);
+    return { status: 'sent', sid: result.id, to };
   } catch (err) {
     const { code, message: rawMsg } = extractTwilioError(err);
     const reason = humanizeTwilioError(code, rawMsg);
@@ -299,13 +319,12 @@ async function sendReply(to: string, message: string, options: DeliveryOptions =
     return;
   }
 
-  const client = getClient();
-  if (!client) {
+  if (!canDeliver()) {
     console.log('[WhatsApp] DEMO REPLY to', target, ':', message);
     return;
   }
   try {
-    await client.messages.create({ from: getFrom(), to: target, body: message });
+    await deliver(target, message);
   } catch (err) {
     const { code, message: rawMsg } = extractTwilioError(err);
     console.error(`[WhatsApp] Reply send error to ${target} (code=${code}): ${rawMsg}`);
@@ -973,14 +992,14 @@ export async function sendTimerAlert(stepId: string, options: DeliveryOptions = 
 
   // Send to worker
   const workerTo = normalizeWhatsAppTo(step.assignedUser.phone);
-  const client = getClient();
+  const deliverable = canDeliver();
 
-  if (options.simulate || !client) {
+  if (options.simulate || !deliverable) {
     console.log('[WhatsApp] TIMER ALERT to worker:', workerTo);
     console.log('[WhatsApp] Message:', workerMsg);
   } else {
     try {
-      await client.messages.create({ from: getFrom(), to: workerTo, body: workerMsg });
+      await deliver(workerTo, workerMsg);
     } catch (err) {
       const { code, message: rawMsg } = extractTwilioError(err);
       console.error(`[WhatsApp] Timer alert to worker failed (code=${code}): ${rawMsg}`);
@@ -995,7 +1014,7 @@ export async function sendTimerAlert(stepId: string, options: DeliveryOptions = 
       userId: step.assignedUserId,
       direction: 'OUTBOUND',
       content: workerMsg,
-      status: options.simulate ? 'simulated' : (client ? 'sent' : 'demo_sent'),
+      status: options.simulate ? 'simulated' : (deliverable ? 'sent' : 'demo_sent'),
     },
   });
 
@@ -1053,14 +1072,14 @@ export async function sendSubTaskTimerAlert(subTaskId: string, options: Delivery
   const workerMsg = msgFn(subTask.step.job.jobNumber, label, subTask.durationMinutes);
 
   const workerTo = normalizeWhatsAppTo(subTask.assignedUser.phone);
-  const client = getClient();
+  const deliverable = canDeliver();
 
-  if (options.simulate || !client) {
+  if (options.simulate || !deliverable) {
     console.log('[WhatsApp] SUBTASK TIMER ALERT to worker:', workerTo);
     console.log('[WhatsApp] Message:', workerMsg);
   } else {
     try {
-      await client.messages.create({ from: getFrom(), to: workerTo, body: workerMsg });
+      await deliver(workerTo, workerMsg);
     } catch (err) {
       const { code, message: rawMsg } = extractTwilioError(err);
       console.error(`[WhatsApp] Sub-task timer alert failed (code=${code}): ${rawMsg}`);
@@ -1074,7 +1093,7 @@ export async function sendSubTaskTimerAlert(subTaskId: string, options: Delivery
       userId: subTask.assignedUserId,
       direction: 'OUTBOUND',
       content: workerMsg,
-      status: options.simulate ? 'simulated' : (client ? 'sent' : 'demo_sent'),
+      status: options.simulate ? 'simulated' : (deliverable ? 'sent' : 'demo_sent'),
     },
   });
 
@@ -1114,19 +1133,18 @@ export async function sendTestMessage(rawPhone: string, customBody?: string): Pr
   const to = normalizeWhatsAppTo(rawPhone);
   const body =
     customBody?.trim() ||
-    `🧪 *Stone Co – WhatsApp Test*\n\nIf you can read this, your Twilio Sandbox + ngrok webhook are wired correctly.\n\nReply *DONE* to confirm two-way delivery.`;
+    `🧪 *Stone Co – WhatsApp Test*\n\nIf you can read this, your WhatsApp webhook is wired correctly.\n\nReply *DONE* to confirm two-way delivery.`;
 
-  const client = getClient();
-  if (!client) {
+  if (!canDeliver()) {
     return {
       status: 'demo_sent',
       to,
-      errorMessage: 'TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN are missing in backend/.env — running in DEMO mode.',
+      errorMessage: 'No WhatsApp provider configured — set META_* (preferred) or TWILIO_* env vars. Running in DEMO mode.',
     };
   }
   try {
-    const result = await client.messages.create({ from: getFrom(), to, body });
-    return { status: 'sent', sid: result.sid, to };
+    const result = await deliver(to, body);
+    return { status: 'sent', sid: result.id, to };
   } catch (err) {
     const { code, message: rawMsg } = extractTwilioError(err);
     return {

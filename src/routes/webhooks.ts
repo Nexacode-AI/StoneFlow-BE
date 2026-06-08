@@ -1,9 +1,56 @@
 import { Router, Request, Response } from 'express';
 import express from 'express';
 import { handleInboundMessage, sendTestMessage } from '../services/whatsapp';
+import {
+  verifyWebhookSubscription,
+  verifyMetaSignature,
+  parseMetaInbound,
+  metaConfigured,
+} from '../services/meta';
 import prisma from '../lib/prisma';
 
 const router = Router();
+
+// ─── Meta WhatsApp Cloud API webhook ──────────────────────────────────────────
+// GET  /api/webhooks/meta  – subscription verification (hub.challenge handshake)
+router.get('/meta', (req: Request, res: Response) => {
+  const challenge = verifyWebhookSubscription(
+    req.query['hub.mode'],
+    req.query['hub.verify_token'],
+    req.query['hub.challenge'],
+  );
+  if (challenge !== null) {
+    console.log('[Meta] Webhook verification successful');
+    res.status(200).send(challenge);
+  } else {
+    console.warn('[Meta] Webhook verification failed');
+    res.sendStatus(403);
+  }
+});
+
+// POST /api/webhooks/meta  – inbound messages (signed with X-Hub-Signature-256)
+router.post('/meta', async (req: Request, res: Response) => {
+  const signature = req.headers['x-hub-signature-256'] as string | undefined;
+  const rawBody = (req as Request & { rawBody?: Buffer }).rawBody;
+
+  if (!verifyMetaSignature(rawBody, signature)) {
+    console.warn('[Meta] Rejected webhook: invalid or missing X-Hub-Signature-256');
+    res.sendStatus(403);
+    return;
+  }
+
+  // Ack immediately so Meta does not retry; process asynchronously.
+  res.sendStatus(200);
+
+  try {
+    const inbound = parseMetaInbound(req.body);
+    if (!inbound) return; // status callback or unsupported type
+    console.log('[Meta] Inbound from:', inbound.from, '| Message:', inbound.text);
+    await handleInboundMessage(`whatsapp:${inbound.from}`, inbound.text, inbound.messageId);
+  } catch (err) {
+    console.error('[Meta] Inbound processing error:', err);
+  }
+});
 
 // GET /api/webhooks/whatsapp  – Twilio validation (challenge not needed for Twilio, but kept for Meta compatibility)
 router.get('/whatsapp', (req: Request, res: Response) => {
@@ -111,10 +158,19 @@ router.get('/config', (_req: Request, res: Response) => {
   res.json({
     success: true,
     data: {
-      from: process.env.TWILIO_WHATSAPP_FROM || 'whatsapp:+14155238886',
-      hasSid: !!process.env.TWILIO_ACCOUNT_SID,
-      hasToken: !!process.env.TWILIO_AUTH_TOKEN,
-      verifyTokenSet: !!process.env.WHATSAPP_VERIFY_TOKEN,
+      provider: metaConfigured() ? 'meta' : (process.env.TWILIO_ACCOUNT_SID ? 'twilio' : 'demo'),
+      twilio: {
+        from: process.env.TWILIO_WHATSAPP_FROM || 'whatsapp:+14155238886',
+        hasSid: !!process.env.TWILIO_ACCOUNT_SID,
+        hasToken: !!process.env.TWILIO_AUTH_TOKEN,
+      },
+      meta: {
+        configured: metaConfigured(),
+        hasAccessToken: !!process.env.META_ACCESS_TOKEN,
+        hasPhoneNumberId: !!process.env.META_PHONE_NUMBER_ID,
+        hasAppSecret: !!process.env.META_APP_SECRET,
+        verifyTokenSet: !!(process.env.META_WEBHOOK_VERIFY_TOKEN || process.env.WHATSAPP_VERIFY_TOKEN),
+      },
     },
   });
 });

@@ -50,7 +50,15 @@ app.use(morgan('dev'));
 
 // WhatsApp webhook from Twilio sends application/x-www-form-urlencoded
 app.use('/api/webhooks', express.urlencoded({ extended: false }));
-app.use(express.json({ limit: '10mb' }));
+// Capture the raw JSON body so Meta's X-Hub-Signature-256 can be verified against it
+app.use(
+  express.json({
+    limit: '10mb',
+    verify: (req, _res, buf) => {
+      (req as Request & { rawBody?: Buffer }).rawBody = buf;
+    },
+  }),
+);
 
 // ─── Routes ──────────────────────────────────────────────────────────────────
 app.get('/health', (_req, res) => res.json({ status: 'ok', ts: new Date().toISOString() }));
